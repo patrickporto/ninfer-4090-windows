@@ -3,6 +3,7 @@
 #include "core/nvtx.h"
 #include "core/transfer_work.h"
 #include "ninfer/types.h"
+#include "runtime/contract/uint128.h"
 
 #include <atomic>
 #include <array>
@@ -244,15 +245,18 @@ struct PrefillWork {
     result.tokens                       = suffix_tokens;
     result.vision_items                 = vision_items;
     result.vision_patches               = vision_patches;
-    const unsigned __int128 suffix      = suffix_tokens;
-    const unsigned __int128 linear      = static_cast<unsigned __int128>(prefix_tokens) * suffix;
-    const unsigned __int128 triangular  = suffix * (suffix + 1U) / 2U;
-    constexpr unsigned __int128 maximum = ~static_cast<unsigned __int128>(0);
-    const unsigned __int128 attention =
-        triangular > maximum - linear ? maximum : linear + triangular;
-    result.attention_pairs = attention > std::numeric_limits<std::uint64_t>::max()
-                                 ? std::numeric_limits<std::uint64_t>::max()
-                                 : static_cast<std::uint64_t>(attention);
+    constexpr std::uint64_t u64_max = std::numeric_limits<std::uint64_t>::max();
+    const auto [linear_low, linear_high] = uint128_product(prefix_tokens, suffix_tokens);
+    const std::uint64_t linear = linear_high != 0 ? u64_max : linear_low;
+    std::uint64_t triangular   = u64_max;
+    if (suffix_tokens != u64_max) {
+        const auto [product_low, product_high] = uint128_product(suffix_tokens, suffix_tokens + 1U);
+        if ((product_high >> 1U) == 0) {
+            triangular = (product_low >> 1U) | (product_high << 63U);
+        }
+    }
+    result.attention_pairs =
+        triangular > u64_max - linear ? u64_max : linear + triangular;
     return result;
 }
 

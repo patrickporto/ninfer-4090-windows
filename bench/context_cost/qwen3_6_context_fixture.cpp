@@ -7,6 +7,7 @@
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/engine.h"
+#include "runtime/contract/uint128.h"
 #include <ninfer/targets/qwen3_6_27b/package.h>
 #include <ninfer/targets/qwen3_6_35b_a3b/package.h>
 
@@ -399,12 +400,18 @@ std::vector<TextCase> text_cases(std::uint32_t chunk) {
 }
 
 std::uint64_t attention_pairs(std::uint32_t prefix, std::uint32_t suffix) {
-    const unsigned __int128 pairs = static_cast<unsigned __int128>(prefix) * suffix +
-                                    static_cast<unsigned __int128>(suffix) * (suffix + 1ULL) / 2U;
-    if (pairs > std::numeric_limits<std::uint64_t>::max()) {
+    const auto [linear_low, linear_high] = uint128_product(prefix, suffix);
+    const auto [tri_low, tri_high] =
+        uint128_product(suffix, static_cast<std::uint64_t>(suffix) + 1ULL);
+    const std::uint64_t triangular_low  = (tri_low >> 1U) | (tri_high << 63U);
+    const std::uint64_t triangular_high = tri_high >> 1U;
+    const std::uint64_t pairs_low  = linear_low + triangular_low;
+    const std::uint64_t pairs_high =
+        linear_high + triangular_high + (pairs_low < linear_low ? 1ULL : 0ULL);
+    if (pairs_high != 0) {
         throw std::overflow_error("prefill attention-pair count exceeds uint64");
     }
-    return static_cast<std::uint64_t>(pairs);
+    return pairs_low;
 }
 
 std::vector<std::uint8_t> block_ppm(int width, int height, std::uint8_t value) {

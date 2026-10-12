@@ -5,7 +5,11 @@
 #include <spdlog/sinks/sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -151,7 +155,12 @@ void report_logging_error(const std::string& message) noexcept {
 class ProgressAwareStderrSink final : public spdlog::sinks::sink {
 public:
     explicit ProgressAwareStderrSink(spdlog::color_mode color)
-        : sink_(color), interactive_(::isatty(STDERR_FILENO) == 1) {}
+        : sink_(color),
+#ifdef _WIN32
+          interactive_(::_isatty(::_fileno(stderr)) == 1) {}
+#else
+          interactive_(::isatty(STDERR_FILENO) == 1) {}
+#endif
 
     ~ProgressAwareStderrSink() override { clear(); }
 
