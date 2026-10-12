@@ -282,7 +282,11 @@ AdmissionCandidate<NINFER_QWEN36_VARIANT>::AdmissionCandidate(AdmissionCandidate
 
 template <>
 AdmissionCandidate<NINFER_QWEN36_VARIANT>&
-AdmissionCandidate<NINFER_QWEN36_VARIANT>::operator=(AdmissionCandidate&&) noexcept = default;
+AdmissionCandidate<NINFER_QWEN36_VARIANT>::operator=(AdmissionCandidate&& other) noexcept {
+    // MSVC does not emit out-of-line defaulted assignment-operator specializations.
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 
 template <>
 AdmissionCandidate<NINFER_QWEN36_VARIANT>::~AdmissionCandidate() = default;
@@ -298,8 +302,12 @@ CapturePressureCandidate<NINFER_QWEN36_VARIANT>::CapturePressureCandidate(
 
 template <>
 CapturePressureCandidate<NINFER_QWEN36_VARIANT>&
-CapturePressureCandidate<NINFER_QWEN36_VARIANT>::operator=(CapturePressureCandidate&&) noexcept =
-    default;
+CapturePressureCandidate<NINFER_QWEN36_VARIANT>::operator=(
+    CapturePressureCandidate&& other) noexcept {
+    // MSVC does not emit out-of-line defaulted assignment-operator specializations.
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 
 template <>
 CapturePressureCandidate<NINFER_QWEN36_VARIANT>::~CapturePressureCandidate() = default;

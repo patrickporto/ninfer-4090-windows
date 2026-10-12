@@ -105,7 +105,11 @@ public:
             const std::time_t wall_seconds = std::chrono::system_clock::to_time_t(
                 std::chrono::system_clock::time_point(whole_seconds));
             std::tm local{};
+#ifdef _WIN32
+            localtime_s(&local, &wall_seconds);
+#else
             localtime_r(&wall_seconds, &local);
+#endif
             fmt::format_to(std::back_inserter(destination),
                            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}  ", local.tm_year + 1900,
                            local.tm_mon + 1, local.tm_mday, local.tm_hour, local.tm_min,

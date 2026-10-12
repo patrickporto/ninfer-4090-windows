@@ -947,9 +947,12 @@ private:
                            ? item.estimated_total_ns - parent.estimated_total_ns
                            : 0;
             };
-            const __uint128_t left  = static_cast<__uint128_t>(delta(cost)) * b;
-            const __uint128_t right = static_cast<__uint128_t>(delta(prior)) * a;
-            if (left != right) { return left < right; }
+            const auto left  = uint128_product(delta(cost), b);
+            const auto right = uint128_product(delta(prior), a);
+            if (left != right) {
+                return left.second != right.second ? left.second < right.second
+                                                   : left.first < right.first;
+            }
         }
         return cost.key() < prior.key();
     }
