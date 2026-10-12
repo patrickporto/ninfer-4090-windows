@@ -1,0 +1,81 @@
+name: Release Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows
+  cancel-in-progress: true
+
+env:
+  VCPKG_COMMIT: 4bca8fd8654e5ba76f92661db7bfe954768ad8ef
+  VCPKG_ROOT: C:\vcpkg
+  VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-cache,readwrite
+
+jobs:
+  build-and-release:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "13.1.1"
+          method: network
+
+      - name: Cache vcpkg binary archives
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-
+
+      - name: Setup vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          git -C $env:VCPKG_ROOT checkout $env:VCPKG_COMMIT
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+        shell: pwsh
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-windows -G Ninja `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_CUDA_ARCHITECTURES=89 `
+            -DNINFER_BUILD_BENCHMARKS=ON
+        shell: pwsh
+
+      - name: Build
+        run: cmake --build build-windows --parallel
+        shell: pwsh
+
+      - name: Package release bundle
+        id: package
+        run: |
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $version = (Get-Content VERSION -Raw).Trim()
+          $tag = "v$version-$shortSha"
+          scripts\package-release.ps1 -ReleaseTag $tag -BuildRoot build-windows
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        shell: pwsh
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.package.outputs.tag }}
+          name: NInfer ${{ steps.package.outputs.tag }} (Windows x64, RTX 4090)
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dist/ninfer-rtx4090-windows-x64-${{ steps.package.outputs.tag }}.zip
+            dist/SHA256SUMS-${{ steps.package.outputs.tag }}.txt
