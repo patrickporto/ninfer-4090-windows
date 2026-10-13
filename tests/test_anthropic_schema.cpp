@@ -144,8 +144,15 @@ int test_envelope_and_field_policy() {
                       "Engine top_k range was not enforced");
     body                  = base_request();
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] { (void)parse(body); }) == "output_config_format_not_supported",
-                      "structured output was silently downgraded");
+    failures += check(api_param([&] { (void)parse(body); }) == "output_config.format",
+                      "json_schema format without schema was accepted");
+    body["output_config"] = Json{
+        {"format", Json{{"type", "json_schema"}, {"schema", Json{{"type", "object"}}}}}};
+    const GenerationRequest structured = parse(body).generation;
+    failures += check(structured.response_format.mode == ResponseFormatMode::JsonSchema &&
+                          Json::parse(structured.response_format.schema_json).at("type") ==
+                              "object",
+                      "structured output format was not lowered");
     body              = base_request();
     body["container"] = "container_1";
     failures += check(api_code([&] { (void)parse(body); }) == "container_not_supported",
@@ -490,7 +497,8 @@ int test_thinking_and_count_tokens() {
 
     body["max_tokens"]                        = 0;
     body["temperature"]                       = "ignored for counting";
-    body["output_config"]                     = Json{{"format", Json{{"type", "json_schema"}}}};
+    body["output_config"]                     = Json{{"format", Json{{"type", "json_schema"},
+                                                            {"schema", Json{{"type", "object"}}}}}};
     const AnthropicCountTokensRequest counted = parse_anthropic_count_tokens_request(body);
     failures += check(counted.generation.enable_thinking == true,
                       "Count Tokens did not share prompt-affecting Thinking parsing");

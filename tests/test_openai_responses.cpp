@@ -723,11 +723,25 @@ int test_explicit_rejections() {
                       "strict function schema is rejected explicitly");
 
     value         = base;
-    value["text"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(api_code([&] {
+    value["text"] = Json{{"format",
+                          Json{{"type", "json_schema"},
+                               {"name", "answer"},
+                               {"strict", true},
+                               {"schema", Json{{"type", "object"}}}}}};
+    const OpenAIResponsesCreateRequest structured =
+        parse_openai_responses_create_request(value, limits());
+    failures += check(structured.prompt.generation.response_format.mode ==
+                              ResponseFormatMode::JsonSchema &&
+                          structured.prompt.generation.response_format.name == "answer" &&
+                          structured.prompt.generation.response_format.strict,
+                      "structured output format is parsed");
+
+    value         = base;
+    value["text"] = Json{{"format", Json{{"type", "json_schema"}, {"name", "answer"}}}};
+    failures += check(api_error([&] {
                           (void)parse_openai_responses_create_request(value, limits());
-                      }) == "structured_outputs_not_supported",
-                      "structured output is rejected explicitly");
+                      }).param == "text.format",
+                      "json_schema without schema is rejected explicitly");
 
     value               = base;
     value["background"] = true;

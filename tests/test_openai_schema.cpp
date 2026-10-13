@@ -148,7 +148,6 @@ int test_standard_field_policy() {
     rejected("logit_bias", Json{{"12", 1}}, "logit_bias_not_supported");
     rejected("logprobs", true, "logprobs_not_supported");
     rejected("top_logprobs", 2, "logprobs_not_supported");
-    rejected("response_format", Json{{"type", "json_schema"}}, "response_format_not_supported");
     rejected("modalities", Json::array({"text", "audio"}), "modality_not_supported");
     rejected("web_search_options", Json::object(), "web_search_not_supported");
     rejected("moderation", Json::object(), "moderation_not_supported");
@@ -185,6 +184,63 @@ int test_standard_field_policy() {
     const OpenAIChatRequest zero        = parse(zero_limit);
     failures += check(zero.output_tokens_explicit && zero.generation.max_tokens == 0,
                       "an explicit zero output limit reaches Engine's no-generation path");
+    return failures;
+}
+
+int test_response_format() {
+    int failures = 0;
+
+    Json json_object               = base_request();
+    json_object["response_format"] = Json{{"type", "json_object"}};
+    const GenerationRequest object_request = parse(json_object).generation;
+    failures += check(object_request.response_format.mode == ResponseFormatMode::JsonObject,
+                      "json_object response_format parsed");
+    failures += check(options(object_request).structured_output.mode ==
+                          ninfer::StructuredOutputMode::JsonObject,
+                      "json_object response_format reaches Engine options");
+
+    Json schema                = base_request();
+    schema["response_format"]  = Json{{"type", "json_schema"},
+                                      {"json_schema",
+                                       Json{{"name", "translation_batch"},
+                                            {"strict", true},
+                                            {"schema",
+                                             Json{{"type", "object"},
+                                                  {"properties",
+                                                   Json{{"translations", Json{{"type", "array"}}}}},
+                                                  {"required",
+                                                   Json::array({"translations"})}}}}}};
+    const GenerationRequest schema_request = parse(schema).generation;
+    failures += check(schema_request.response_format.mode == ResponseFormatMode::JsonSchema &&
+                          schema_request.response_format.name == "translation_batch" &&
+                          schema_request.response_format.strict,
+                      "json_schema response_format parsed with name and strict");
+    failures += check(Json::parse(schema_request.response_format.schema_json).at("type") ==
+                          "object",
+                      "json_schema body retained");
+    const ninfer::StructuredOutputOptions structured = options(schema_request).structured_output;
+    failures += check(structured.mode == ninfer::StructuredOutputMode::JsonSchema &&
+                          structured.name == "translation_batch" && structured.strict &&
+                          Json::parse(structured.schema_json).at("type") == "object",
+                      "json_schema response_format reaches Engine options");
+
+    Json missing_schema                = base_request();
+    missing_schema["response_format"]  = Json{{"type", "json_schema"},
+                                              {"json_schema", Json{{"name", "missing_schema"}}}};
+    failures += check(api_error([&] { (void)parse(missing_schema); }).param ==
+                          "response_format.json_schema.schema",
+                      "json_schema without schema rejected");
+
+    Json unknown               = base_request();
+    unknown["response_format"] = Json{{"type", "yaml"}};
+    failures += check(api_error([&] { (void)parse(unknown); }).code ==
+                          "response_format_type_invalid",
+                      "unknown response_format type rejected");
+
+    Json text               = base_request();
+    text["response_format"] = Json{{"type", "text"}};
+    failures += check(parse(text).generation.response_format.mode == ResponseFormatMode::Text,
+                      "text response_format is neutral");
     return failures;
 }
 
@@ -831,6 +887,7 @@ int main() {
     int failures = 0;
     failures += test_request_envelope_and_sampling();
     failures += test_standard_field_policy();
+    failures += test_response_format();
     failures += test_constrained_decoding_extensions();
     failures += test_tools();
     failures += test_messages_and_media();

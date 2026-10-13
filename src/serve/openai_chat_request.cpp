@@ -131,19 +131,6 @@ void validate_standard_output_controls(const Json& body) {
         }
     }
 
-    if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& format = body.at("response_format");
-        if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
-            bad_request("response_format must contain a string type", "response_format");
-        }
-        if (format.at("type").get<std::string>() != "text") {
-            bad_request(
-                "this response_format requires constrained output, which NInfer cannot guarantee; "
-                "only {\"type\":\"text\"} is available",
-                "response_format", "response_format_not_supported");
-        }
-    }
-
     if (body.contains("modalities") && !body.at("modalities").is_null()) {
         const Json& modalities = body.at("modalities");
         if (!modalities.is_array() || modalities.empty()) {
@@ -772,6 +759,55 @@ void parse_stop(const Json& body, GenerationRequest& output) {
     }
 }
 
+void parse_response_format(const Json& body, GenerationRequest& output) {
+    if (!body.contains("response_format") || body.at("response_format").is_null()) { return; }
+    const Json& format = body.at("response_format");
+    if (!format.is_object()) {
+        bad_request("response_format must be an object or null", "response_format");
+    }
+    if (!format.contains("type") || !format.at("type").is_string()) {
+        bad_request("response_format.type must be a string", "response_format.type");
+    }
+
+    const std::string type = format.at("type").get<std::string>();
+    if (type == "text") {
+        output.response_format.mode = ResponseFormatMode::Text;
+        return;
+    }
+    if (type == "json_object") {
+        output.response_format.mode = ResponseFormatMode::JsonObject;
+        return;
+    }
+    if (type != "json_schema") {
+        bad_request("response_format.type must be text, json_object, or json_schema",
+                    "response_format.type", "response_format_type_invalid");
+    }
+    if (!format.contains("json_schema") || !format.at("json_schema").is_object()) {
+        bad_request("response_format.json_schema must be an object",
+                    "response_format.json_schema");
+    }
+
+    const Json& definition = format.at("json_schema");
+    if (!definition.contains("name") || !definition.at("name").is_string() ||
+        definition.at("name").get_ref<const std::string&>().empty()) {
+        bad_request("response_format.json_schema.name must be a non-empty string",
+                    "response_format.json_schema.name");
+    }
+    if (!definition.contains("schema") || !definition.at("schema").is_object()) {
+        bad_request("response_format.json_schema.schema must be an object",
+                    "response_format.json_schema.schema");
+    }
+    if (definition.contains("strict") && !definition.at("strict").is_boolean()) {
+        bad_request("response_format.json_schema.strict must be a boolean",
+                    "response_format.json_schema.strict");
+    }
+
+    output.response_format.mode        = ResponseFormatMode::JsonSchema;
+    output.response_format.name        = definition.at("name").get<std::string>();
+    output.response_format.schema_json = definition.at("schema").dump();
+    output.response_format.strict      = definition.value("strict", false);
+}
+
 void parse_sampling(const Json& body, GenerationRequest& output) {
     SamplingParams& sampling   = output.sampling;
     sampling.temperature       = get_number(body, "temperature");
@@ -924,6 +960,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_messages(body, output.generation);
     parse_stop(body, output.generation);
     parse_sampling(body, output.generation);
+    parse_response_format(body, output.generation);
     parse_stream_options(body, output);
     parse_response_observations(body, output);
     parse_output_limit(body, limits, output);

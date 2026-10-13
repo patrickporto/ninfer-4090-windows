@@ -893,15 +893,24 @@ void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose p
     }
 }
 
-void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
+void parse_effort(const Json& body, GenerationRequest& request) {
     if (!body.contains("output_config") || body.at("output_config").is_null()) { return; }
     const Json& config = body.at("output_config");
     if (!config.is_object()) { bad_request("output_config must be an object", "output_config"); }
-    if (purpose == ParsePurpose::Messages && config.contains("format") &&
-        !config.at("format").is_null()) {
-        bad_request("output_config.format requires constrained decoding, which NInfer does not "
-                    "provide",
-                    "output_config.format", "output_config_format_not_supported");
+    if (config.contains("format") && !config.at("format").is_null()) {
+        const Json& format = config.at("format");
+        if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
+            bad_request("output_config.format must be a typed object", "output_config.format");
+        }
+        if (format.at("type").get<std::string>() != "json_schema") {
+            bad_request("output_config.format.type must be 'json_schema'", "output_config.format",
+                        "response_format_type_invalid");
+        }
+        if (!format.contains("schema") || !format.at("schema").is_object()) {
+            bad_request("output_config.format.schema must be an object", "output_config.format");
+        }
+        request.response_format.mode        = ResponseFormatMode::JsonSchema;
+        request.response_format.schema_json = format.at("schema").dump();
     }
     if (!config.contains("effort") || config.at("effort").is_null()) { return; }
     if (!config.at("effort").is_string()) {
@@ -1021,7 +1030,7 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
     parse_system(body, request);
     parse_messages(body, request);
     parse_thinking(body, request, purpose, effective_max_tokens);
-    parse_effort(body, request, purpose);
+    parse_effort(body, request);
     apply_anthropic_prompt_cache_policy(body, request);
     if (body.contains("container") && !body.at("container").is_null()) {
         bad_request("container requires an external execution environment that NInfer does not "

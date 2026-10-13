@@ -941,7 +941,7 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
     out.generation.reasoning_effort = *effort;
 }
 
-void parse_text(const Json& body) {
+void parse_text(const Json& body, GenerationRequest& out) {
     if (!body.contains("text") || body.at("text").is_null()) { return; }
     const Json& text = body.at("text");
     if (!text.is_object()) { bad_request("text must be an object", "text"); }
@@ -952,10 +952,32 @@ void parse_text(const Json& body) {
         if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
             bad_request("text.format must be a typed object", "text");
         }
-        if (format.at("type").get<std::string>() != "text" || format.size() != 1) {
-            bad_request("structured text output requires constrained decoding, which the Engine "
-                        "does not provide",
-                        "text", "structured_outputs_not_supported");
+        const std::string type = format.at("type").get<std::string>();
+        if (type == "text") {
+            if (format.size() != 1) {
+                bad_request("text.format of type 'text' accepts no additional fields", "text");
+            }
+        } else if (type == "json_object") {
+            out.response_format.mode = ResponseFormatMode::JsonObject;
+        } else if (type == "json_schema") {
+            if (!format.contains("name") || !format.at("name").is_string() ||
+                format.at("name").get_ref<const std::string&>().empty()) {
+                bad_request("text.format.name must be a non-empty string", "text.format");
+            }
+            if (!format.contains("schema") || !format.at("schema").is_object()) {
+                bad_request("text.format.schema must be an object", "text.format");
+            }
+            if (format.contains("strict") && !format.at("strict").is_null() &&
+                !format.at("strict").is_boolean()) {
+                bad_request("text.format.strict must be a boolean", "text.format");
+            }
+            out.response_format.mode        = ResponseFormatMode::JsonSchema;
+            out.response_format.name        = format.at("name").get<std::string>();
+            out.response_format.schema_json = format.at("schema").dump();
+            out.response_format.strict      = format.value("strict", false);
+        } else {
+            bad_request("text.format.type must be text, json_object, or json_schema", "text",
+                        "response_format_type_invalid");
         }
     }
     if (text.contains("verbosity") && !text.at("verbosity").is_null()) {
@@ -1049,7 +1071,7 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
                     "parallel_tool_calls", "parallel_tool_calls_not_supported");
     }
     parse_reasoning(body, out.prompt);
-    parse_text(body);
+    parse_text(body, out.prompt.generation);
     parse_truncation(body);
     parse_preserve_thinking(body, out.prompt);
     out.prompt.generation.max_tokens = limits.default_max_tokens;
