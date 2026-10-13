@@ -343,8 +343,13 @@ collapses prose acceptance to 24%. It also pins the v3 artifact gate to upstream
 2. soohl INT8 dense prefill: kernel-bench + temp-0 quality gate (unchanged).
 3. DFlash2 only after the quality gate (greedy text differs from MTP3) and a fit decision (224K no
    vision or 192K + vision on 24 GB).
-4. Parked: the two #9 robustness follow-ups; gzenz tool-call pair and the UDP structured-JSON port,
-   re-judged against upstream #294/#299 at catch-up #4.
+4. Parked: the two #9 robustness follow-ups and the gzenz tool-call pair, re-judged against
+   upstream #294/#299 at catch-up #4.
+5. DONE (this tree, Windows port): UDP structured-JSON design port landed — XGrammar v0.2.5.post1
+   grammar mask (`response_format` json_object/json_schema on Chat Completions, `text.format` on
+   Responses, `output_config.format` on Anthropic Messages), MTP preserved with the mask scoped to
+   the first verify position, re-homed from the removed `concurrent_executor.h` onto EngineCore
+   hooks and per-round host-ingress sampling republication.
 
 Hand-off for the next session: `ninfer-recon-notes/HANDOFF.md` top (2026-09-22).
 
