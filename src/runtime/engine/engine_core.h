@@ -218,7 +218,8 @@ public:
         std::shared_ptr<Request> request;
         try {
             auto output = instance_.loaded->frontend.make_output_session(
-                prompt, options.stop, options.output, options.execution.thinking);
+                prompt, options.stop, options.output, options.execution.thinking,
+                options.structured_output);
             const std::uint32_t capacity_output =
                 max_context_ - prompt_summary.prompt_tokens + static_cast<std::uint32_t>(1);
             try {
@@ -1396,8 +1397,12 @@ private:
                 }
                 const OutputDecision decision = request->output.preview_model(
                     row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                // A grammar-constrained session may license a partial non-terminal prefix when a
+                // speculative draft leaves the grammar mid-round; the Program accepts the short
+                // commit and the next round resamples under the corrected mask.
                 if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
-                    (!decision.finished() && decision.accepted_tokens != count) ||
+                    (!decision.finished() && decision.accepted_tokens != count &&
+                     !request->output.has_token_constraint()) ||
                     (decision.finished() && decision.continuation != ContinuationAction::Decode) ||
                     (decision.prefix_execution_split_after &&
                      (*decision.prefix_execution_split_after == 0 ||
@@ -1510,6 +1515,13 @@ private:
                 auto published = request->output.commit_preview();
                 auto timing    = record_committed_output(request, accepted);
                 append_output(request, std::move(published), std::move(timing));
+                if (!cancelled[row] && !decisions[row].terminal &&
+                    request->output.has_token_constraint()) {
+                    // Covers both decode rounds and the prefill Begin token: both reach this loop
+                    // through commit_pending, after commit_preview advanced the grammar matcher.
+                    instance_.program->set_token_mask_lane(
+                        lane, request->output.next_token_bitmask());
+                }
                 if (decisions[row].terminal) {
                     if (cancelled[row]) {
                         terminal_requests[terminal_count] = request;
@@ -1711,6 +1723,13 @@ private:
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
         if (!request->base_plan) {
+            if (request->output.has_token_constraint()) {
+                // Seed the lane's sampling mask from the grammar root before planning so the
+                // Program installs it at sequence start. Speculation stays enabled: the mask
+                // constrains only the first verify position of each round.
+                const auto mask = request->output.next_token_bitmask();
+                request->options.execution.token_mask.assign(mask.begin(), mask.end());
+            }
             request->base_plan.emplace(
                 instance_.program->plan_request(request->prompt, request->options.execution));
         }

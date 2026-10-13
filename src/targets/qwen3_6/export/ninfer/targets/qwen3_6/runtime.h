@@ -975,6 +975,9 @@ public:
     [[nodiscard]] PendingBatch<Variant> decode(std::span<const SequenceHandle<Variant>> sequences,
                                                std::span<const runtime::RoundBudget> budgets,
                                                runtime::ExecutionTiming* failed_timing = nullptr);
+    // Replaces the grammar token bitmask bound to one lane's sampling config. The mask is the
+    // ceil(token_domain/32) bitset produced by the Frontend's OutputSession for that lane.
+    void set_token_mask_lane(std::uint32_t lane, std::span<const std::uint32_t> mask);
     // Advance each live sequence with its exact target-owned token row. This does not sample or
     // advance sampler RNG/occurrence state; callers own output publication and budget accounting.
     // Each optional execution split is relative to its row's forced-token span.

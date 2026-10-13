@@ -962,6 +962,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     token_counts    = plan.persistent.token_counts.bind(backing);
     sampling_config = plan.persistent.sampling_config.bind(backing);
+    token_masks     = plan.persistent.token_masks.bind(backing);
     active_continuations.fill(continuation_capacity);
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) { lane_epochs[lane] = 1; }
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
@@ -1015,6 +1016,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
+    CUDA_CHECK(cudaMemsetAsync(token_masks.data, 0, token_masks.bytes(), device.stream));
     device.synchronize();
     if (use_cuda_graph) {
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
@@ -10028,6 +10030,10 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                                                                 : 0U;
         ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
         install_sampling(sequence, request, request_plan.sampling);
+        if (!request_plan.token_mask.empty()) {
+            request.initial_token_mask = request_plan.token_mask;
+            set_token_mask_lane(lane, request.initial_token_mask);
+        }
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
@@ -10171,9 +10177,14 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             throw std::logic_error("speculative pending row is not at its recorded base");
         }
         const std::uint32_t committed = cancelled[row] ? 0U : accepted_tokens[row];
+        // A grammar-constrained lane may license a partial non-terminal prefix: the mask covers
+        // only the first speculative position, so the Frontend can reject a later draft mid-round.
+        const bool grammar_constrained =
+            !cancelled[row] && requests[lane].sampling_host.token_mask != nullptr;
         if ((cancelled[row] && accepted_tokens[row] != 0) ||
             (!cancelled[row] && (committed == 0 || committed > pending.produced ||
-                                 (!terminal[row] && committed != pending.produced)))) {
+                                 (!terminal[row] && committed != pending.produced &&
+                                  !grammar_constrained)))) {
             throw std::logic_error("speculative pending row has an invalid committed prefix");
         }
         const StateImageSelectors selectors = state_selectors(sequence);
@@ -10181,11 +10192,10 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             ops::GdnReplayFoldRow{.source_state_slot      = selectors.source,
                                   .destination_state_slot = selectors.destination,
                                   .commit_columns         = static_cast<std::int32_t>(committed)};
-        const bool partial_terminal =
-            !cancelled[row] && terminal[row] && committed < pending.produced;
+        const bool partial_commit = !cancelled[row] && committed < pending.produced;
         hidden_selectors[row] =
-            static_cast<std::int32_t>(partial_terminal ? committed - 1U : pending.produced - 1U);
-        needs_hidden_correction = needs_hidden_correction || partial_terminal;
+            static_cast<std::int32_t>(partial_commit ? committed - 1U : pending.produced - 1U);
+        needs_hidden_correction = needs_hidden_correction || partial_commit;
     }
 
     const auto tail_started = Clock::now();
@@ -10307,7 +10317,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
 
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 sequence.mtp_kv_valid = sequence.execution_frontier;
-                if (terminal[row]) {
+                if (terminal[row] || committed < pending.produced) {
                     sequence.mtp_draft_count = 0;
                 } else {
                     const std::int32_t next  = mtp_host_egress->next_extents[row];
@@ -10463,6 +10473,7 @@ bool ProgramImplCore::clear_lane_strict(SequenceState& sequence, RequestControl&
     request.prefill.reset();
     request.lifecycle            = Lifecycle::Empty;
     request.pending              = {};
+    request.initial_token_mask   = {};
     request.active_resources     = {};
     request.optional_resources   = {};
     request.publish_continuation = true;
@@ -10487,6 +10498,7 @@ void ProgramImplCore::clear_lane_best_effort(SequenceState& sequence,
     request.prefill.reset();
     request.lifecycle            = Lifecycle::Empty;
     request.pending              = {};
+    request.initial_token_mask   = {};
     request.active_resources     = {};
     request.optional_resources   = {};
     request.publish_continuation = true;
@@ -11396,6 +11408,25 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
     request.sampling_host.token_counts =
         penalties ? static_cast<std::int32_t*>(counts.data) : nullptr;
     Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1);
+    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
+                               sizeof(request.sampling_host), cudaMemcpyHostToDevice,
+                               device.stream));
+}
+
+void ProgramImplCore::set_token_mask_lane(std::uint32_t lane,
+                                          std::span<const std::uint32_t> mask) {
+    if (lane >= max_concurrency) { throw std::out_of_range("token-mask lane is out of range"); }
+    const std::size_t expected = static_cast<std::size_t>((TextConfig::token_domain + 31) / 32);
+    if (mask.size() != expected) { throw std::invalid_argument("token mask has an invalid size"); }
+    Tensor device_mask = token_masks.slice(1, static_cast<std::int32_t>(lane), 1)
+                             .view({static_cast<std::int32_t>(expected)});
+    CUDA_CHECK(cudaMemcpyAsync(device_mask.data, mask.data(), device_mask.bytes(),
+                               cudaMemcpyHostToDevice, device.stream));
+    RequestControl& request          = requests[lane];
+    request.sampling_host.token_mask = static_cast<const std::uint32_t*>(device_mask.data);
+    // Decode rounds re-publish sampling_host through the host ingress every round, but prefill
+    // sampling and graph-captured paths read the device-resident lane config; keep both current.
+    Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
     CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
                                sizeof(request.sampling_host), cudaMemcpyHostToDevice,
                                device.stream));

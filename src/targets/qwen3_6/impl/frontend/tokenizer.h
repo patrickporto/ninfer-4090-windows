@@ -151,6 +151,9 @@ public:
     [[nodiscard]] bool is_special_token(int id) const noexcept;
     [[nodiscard]] bool is_valid_token(int id) const noexcept;
     [[nodiscard]] bool has_exact_token_domain(std::size_t size) const noexcept;
+    // Raw decoded bytes of every vocabulary entry (empty for invalid ids), for grammar compilers
+    // that match against exact token text.
+    [[nodiscard]] std::vector<std::string> decoded_vocabulary() const;
 
 private:
     std::vector<std::string> decoded_token_bytes_;

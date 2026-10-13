@@ -12,6 +12,9 @@
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
+#include <xgrammar/compiler.h>
+#include <xgrammar/matcher.h>
+#include <xgrammar/tokenizer_info.h>
 
 #include <algorithm>
 #include <array>
@@ -942,6 +945,13 @@ public:
             }
             defaults.token_ids.push_back(token);
         }
+        std::vector<std::int32_t> stop_tokens(defaults.token_ids.begin(),
+                                              defaults.token_ids.end());
+        std::vector<std::string> decoded_vocab = tokenizer->decoded_vocabulary();
+        const int vocab_size                   = static_cast<int>(decoded_vocab.size());
+        grammar_compiler = std::make_shared<xgrammar::GrammarCompiler>(xgrammar::TokenizerInfo(
+            decoded_vocab, xgrammar::VocabType::RAW, vocab_size, std::move(stop_tokens)));
+        grammar_vocab_size = vocab_size;
         std::vector<TokenId> encoded = tokenizer->encode(kThinkingControl);
         if (encoded.empty()) {
             throw std::invalid_argument(
@@ -971,8 +981,10 @@ public:
     std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
-    bool vision_enabled       = true;
-    std::uint32_t max_context = 0;
+    std::shared_ptr<xgrammar::GrammarCompiler> grammar_compiler;
+    int grammar_vocab_size      = 0;
+    bool vision_enabled         = true;
+    std::uint32_t max_context   = 0;
 };
 
 class OutputSession::Impl {
@@ -980,23 +992,43 @@ public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
          bool starts_in_reasoning, ThinkingControlOptions thinking,
          std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens_,
-         std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_)
+         std::shared_ptr<const fi::ToolCallOutputContract> tool_call_output_,
+         const StructuredOutputOptions& structured,
+         const std::shared_ptr<xgrammar::GrammarCompiler>& grammar_compiler, int grammar_vocab)
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
-          split_reasoning(starts_in_reasoning && !output.raw),
+          split_reasoning(starts_in_reasoning && !output.raw && !structured.enabled()),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
                            output.tool_name_max_length, output.tolerant_tool_calls) {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }
+        // A structured response starts at the grammar root and is published as content even when
+        // the model's normal mode would begin in a hidden reasoning channel.
         state.in_reasoning        = split_reasoning;
-        prefix_execution.tracking = starts_in_reasoning;
+        prefix_execution.tracking = starts_in_reasoning && !structured.enabled();
         semantic.budget           = thinking.budget;
         // The presentation decoder already tracks normal reasoning output. Keep the independent
         // semantic tracker dormant unless a cap needs it, so the default unlimited path does not
         // decode every model token twice.
-        semantic.in_reasoning = starts_in_reasoning && thinking.budget.has_value();
+        semantic.in_reasoning =
+            starts_in_reasoning && !structured.enabled() && thinking.budget.has_value();
+        if (structured.enabled()) {
+            if (grammar_compiler == nullptr || grammar_vocab <= 0) {
+                throw std::logic_error("structured output requires a grammar compiler");
+            }
+            xgrammar::CompiledGrammar grammar =
+                structured.mode == StructuredOutputMode::JsonObject
+                    ? grammar_compiler->CompileBuiltinJSONGrammar()
+                    : grammar_compiler->CompileJSONSchema(structured.schema_json, true,
+                                                          std::nullopt, std::nullopt,
+                                                          structured.strict);
+            std::vector<int> stops(policy.token_ids.begin(), policy.token_ids.end());
+            matcher.emplace(grammar, std::move(stops), false, -1);
+            mask.resize(static_cast<std::size_t>(xgrammar::GetBitmaskSize(grammar_vocab)));
+            grammar_vocab_size = grammar_vocab;
+        }
     }
 
     std::shared_ptr<const fi::Tokenizer> tokenizer;
@@ -1015,7 +1047,11 @@ public:
     fi::ToolCallOutputDecoder tool_call_output;
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics tool_call_parse;
-    bool preview_ready = false;
+    std::optional<xgrammar::GrammarMatcher> matcher;
+    std::optional<xgrammar::GrammarMatcher> preview_matcher;
+    std::vector<std::int32_t> mask;
+    int grammar_vocab_size = 0;
+    bool preview_ready     = false;
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -1119,10 +1155,15 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     impl_->preview_prefix_execution = impl_->prefix_execution;
     impl_->preview_execution_split_after.reset();
     impl_->preview_output.clear();
+    if (impl_->matcher) { impl_->preview_matcher = impl_->matcher->Fork(); }
+    std::uint32_t grammar_tokens = 0;
 
     const auto complete = [&](std::uint32_t count, FinishReason reason,
                               runtime::ContinuationAction continuation =
                                   runtime::ContinuationAction::Decode) {
+        if (impl_->preview_matcher && grammar_tokens > count) {
+            impl_->preview_matcher->Rollback(static_cast<int>(grammar_tokens - count));
+        }
         if (reason != FinishReason::None) { impl_->preview_semantic.control_pending = false; }
         if (impl_->preview_execution_split_after && *impl_->preview_execution_split_after > count) {
             throw std::logic_error("prefix execution split exceeds the accepted token prefix");
@@ -1140,6 +1181,16 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         const std::uint32_t count          = static_cast<std::uint32_t>(index + 1);
         const TokenId token                = tokens[index];
         const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
+
+        if (impl_->preview_matcher) {
+            // The grammar mask constrains only the first position of a speculative round, so a
+            // later draft can legitimately leave the grammar; license the accepted prefix and
+            // let the next round resample from the corrected matcher state.
+            if (!impl_->preview_matcher->AcceptToken(token)) {
+                return complete(static_cast<std::uint32_t>(index), FinishReason::None);
+            }
+            ++grammar_tokens;
+        }
 
         if (const auto boundary = impl_->preview_prefix_execution.feed(decoded.bytes);
             boundary && *boundary == decoded.bytes.size()) {
@@ -1303,6 +1354,7 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     impl_->preview_execution_split_after.reset();
     impl_->preview_semantic.control_pending = false;
     impl_->preview_output.clear();
+    if (impl_->matcher) { impl_->preview_matcher = impl_->matcher->Fork(); }
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
     impl_->preview_ready = true;
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
@@ -1314,6 +1366,10 @@ PublishedOutput OutputSession::commit_preview() {
     swap(impl_->state, impl_->preview_state);
     swap(impl_->semantic, impl_->preview_semantic);
     swap(impl_->prefix_execution, impl_->preview_prefix_execution);
+    if (impl_->matcher) {
+        swap(impl_->matcher, impl_->preview_matcher);
+        impl_->preview_matcher.reset();
+    }
     PublishedOutput output = std::move(impl_->preview_output);
     impl_->preview_output.clear();
     impl_->preview_ready = false;
@@ -1363,6 +1419,25 @@ ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
         .injected_tokens       = impl_->semantic.injected_tokens,
         .applied               = impl_->semantic.applied,
     };
+}
+
+bool OutputSession::has_token_constraint() const noexcept {
+    return impl_ != nullptr && impl_->matcher.has_value();
+}
+
+std::span<const std::uint32_t> OutputSession::next_token_bitmask() {
+    if (!has_token_constraint()) { return {}; }
+    std::int64_t shape = static_cast<std::int64_t>(impl_->mask.size());
+    DLTensor tensor{};
+    tensor.data        = impl_->mask.data();
+    tensor.device      = DLDevice{kDLCPU, 0};
+    tensor.ndim        = 1;
+    tensor.dtype       = xgrammar::GetBitmaskDLType();
+    tensor.shape       = &shape;
+    tensor.strides     = nullptr;
+    tensor.byte_offset = 0;
+    (void)impl_->matcher->FillNextTokenBitmask(&tensor);
+    return {reinterpret_cast<const std::uint32_t*>(impl_->mask.data()), impl_->mask.size()};
 }
 
 std::optional<std::string> OutputSession::matched_stop_string() const {
@@ -1608,13 +1683,15 @@ std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
 OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                             const StopPolicy& caller_stop,
                                             const OutputOptions& output,
-                                            const ThinkingControlOptions& thinking) const {
+                                            const ThinkingControlOptions& thinking,
+                                            const StructuredOutputOptions& structured) const {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     StopPolicy policy = merge_stop_policy(*impl_->tokenizer, caller_stop);
     if (output.raw) { policy.publish_stop_token = true; }
     return OutputSession(std::make_unique<OutputSession::Impl>(
         impl_->tokenizer, std::move(policy), output, prompt.data_->starts_in_reasoning, thinking,
-        impl_->thinking_control_tokens, prompt.data_->tool_call_output));
+        impl_->thinking_control_tokens, prompt.data_->tool_call_output, structured,
+        impl_->grammar_compiler, impl_->grammar_vocab_size));
 }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }

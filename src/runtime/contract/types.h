@@ -13,6 +13,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace ninfer::runtime {
 
@@ -161,12 +162,14 @@ struct ResolvedExecutionOptions {
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
+    std::vector<std::uint32_t> token_mask;
 };
 
 struct ResolvedRequestOptions {
     ResolvedExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    StructuredOutputOptions structured_output;
 };
 
 enum class ContinuationAction : std::uint8_t {

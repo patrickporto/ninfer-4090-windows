@@ -530,6 +530,12 @@ PendingBatch<Variant> Program<Variant>::decode(std::span<const SequenceHandle<Va
 }
 
 template <>
+void Program<Variant>::set_token_mask_lane(std::uint32_t lane,
+                                           std::span<const std::uint32_t> mask) {
+    impl_->set_token_mask_lane(lane, mask);
+}
+
+template <>
 runtime::ExecutionTiming Program<Variant>::append_forced_tokens(
     std::span<const SequenceHandle<Variant>> sequences, std::span<const TokenId> row_major_tokens,
     std::uint32_t row_stride, std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
