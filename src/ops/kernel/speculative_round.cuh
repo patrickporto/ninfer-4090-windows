@@ -17,6 +17,37 @@ namespace ninfer::ops {
 
 inline constexpr int kSparseSpeculativeCandidates = 16;
 
+// Block-cooperative penalty/mask-adjusted argmax over one verify-logit column.
+// Every thread of the block must call. Used when a token mask replaces the
+// precomputed raw target argmax at the first verify position.
+__device__ inline std::int32_t speculative_masked_argmax(const __nv_bfloat16* logits,
+                                                         std::int32_t token_domain,
+                                                         const SamplingConfig& cfg,
+                                                         float* values, int* indices) {
+    float best   = -CUDART_INF_F;
+    int best_i   = 0;
+    for (int v = threadIdx.x; v < token_domain; v += blockDim.x) {
+        const float value = sampling_adjusted_logit(__bfloat162float(logits[v]), v, cfg);
+        if (sampling_better(value, v, best, best_i)) {
+            best   = value;
+            best_i = v;
+        }
+    }
+    values[threadIdx.x]  = best;
+    indices[threadIdx.x] = best_i;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride != 0; stride >>= 1) {
+        if (threadIdx.x < stride &&
+            sampling_better(values[threadIdx.x + stride], indices[threadIdx.x + stride],
+                            values[threadIdx.x], indices[threadIdx.x])) {
+            values[threadIdx.x]  = values[threadIdx.x + stride];
+            indices[threadIdx.x] = indices[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    return indices[0];
+}
+
 __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anchors,
                                                          const std::int32_t* drafts,
                                                          const std::int32_t* base_positions,
@@ -117,17 +148,22 @@ __device__ __forceinline__ void speculative_sparse_warp_store(const int* drafts,
     }
 }
 
+// `first_target` replaces target_tokens[row,0] so a grammar-masked first argmax can be
+// injected by callers that computed it from the logits; unmasked callers pass
+// target_tokens[row,0].
 __device__ __forceinline__ void speculative_sparse_warp_greedy(const int* target_tokens,
                                                                const int* drafts, int* lengths,
                                                                int* anchors, int* licensed_tokens,
                                                                int* licensed_counts, int* accepted,
-                                                               int row, int extent, int k) {
+                                                               int row, int extent, int k,
+                                                               int first_target) {
     const int lane = threadIdx.x & 31;
-    const bool reject =
-        lane < extent && target_tokens[row * (k + 1) + lane] != drafts[row * k + lane];
+    const int lane_target =
+        lane == 0 ? first_target : target_tokens[row * (k + 1) + lane];
+    const bool reject = lane < extent && lane_target != drafts[row * k + lane];
     const unsigned mask = __ballot_sync(0xffffffffU, reject);
     const int a         = mask ? __ffs(mask) - 1 : extent;
-    const int terminal  = target_tokens[row * (k + 1) + a];
+    const int terminal  = a == 0 ? first_target : target_tokens[row * (k + 1) + a];
     speculative_sparse_warp_store(drafts, k, row, a, terminal, lengths, anchors, licensed_tokens,
                                   licensed_counts, accepted);
 }
@@ -138,7 +174,8 @@ __global__ __launch_bounds__(256) void speculative_accept_sparse_warp_greedy_ker
     const int row    = threadIdx.x / 32;
     const int extent = min(k, max(0, current_extents[row]));
     speculative_sparse_warp_greedy(target_tokens, drafts, lengths, anchors, licensed_tokens,
-                                   licensed_counts, accepted, row, extent, k);
+                                   licensed_counts, accepted, row, extent, k,
+                                   target_tokens[row * (k + 1)]);
 }
 
 __device__ __forceinline__ void speculative_sparse_warp_accept(
@@ -245,19 +282,27 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
         logits + static_cast<std::int64_t>(row) * cols * physical_rows;
     const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
+    __shared__ float red_val[kSamplerBlock];
+    __shared__ int red_idx[kSamplerBlock];
+
     if (!(cfg.temperature > 0.0f) && !penalties) {
+        // The grammar mask replaces the precomputed raw target only at the first
+        // verify position; later columns keep the unmasked target fast path.
+        int first_target = row_targets[0];
+        if (cfg.token_mask != nullptr) {
+            first_target =
+                speculative_masked_argmax(row_logits, token_domain, cfg, red_val, red_idx);
+        }
         if (tid == 0) {
             int a = 0;
-            while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
-            const int t_star = row_targets[a];
+            while (a < extent && (a == 0 ? first_target : row_targets[a]) == row_drafts[a]) { ++a; }
+            const int t_star = a == 0 ? first_target : row_targets[a];
             speculative_store_accept_result<true>(row_drafts, k, row, a, t_star, lengths, anchors,
                                                   row_tokens, licensed_counts, accepted, &cfg);
         }
         return;
     }
 
-    __shared__ float red_val[kSamplerBlock];
-    __shared__ int red_idx[kSamplerBlock];
     __shared__ float cand_val[kSamplerCandidateCap];
     __shared__ int cand_idx[kSamplerCandidateCap];
     __shared__ float prob[kSamplerCandidateCap];
@@ -284,12 +329,15 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
 
     if (!(cfg.temperature > 0.0f)) {
         for (int i = 0; i <= extent; ++i) {
+            // The grammar mask licenses only the first verify position.
+            SamplingConfig column_cfg = cfg;
+            if (i != 0) { column_cfg.token_mask = nullptr; }
             const std::int64_t base = static_cast<std::int64_t>(i) * physical_rows;
             float best_value        = -CUDART_INF_F;
             int best_index          = INT_MAX;
             for (int v = tid; v < token_domain; v += blockDim.x) {
                 const float value = sampling_adjusted_logit(__bfloat162float(row_logits[base + v]),
-                                                            v, cfg, row_drafts, i);
+                                                            v, column_cfg, row_drafts, i);
                 if (sampling_better(value, v, best_value, best_index)) {
                     best_value = value;
                     best_index = v;
@@ -331,14 +379,18 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
     for (int i = 0; i <= extent; ++i) {
         // Column i is only reached when drafts[0..i-1] were all accepted, so the
         // round-local penalty overlay for this column is exactly those i drafts.
+        // The grammar mask licenses only the first verify position.
+        SamplingConfig column_cfg = cfg;
+        if (i != 0) { column_cfg.token_mask = nullptr; }
         const std::int64_t base = static_cast<std::int64_t>(i) * physical_rows;
         if (token_domain <= kSamplerTileItems) {
-            sampling_build_truncated_small(row_logits, base, token_domain, cfg, red_val, red_idx,
-                                           cand_val, cand_idx, prob, &n_support, row_drafts, i);
+            sampling_build_truncated_small(row_logits, base, token_domain, column_cfg, red_val,
+                                           red_idx, cand_val, cand_idx, prob, &n_support,
+                                           row_drafts, i);
         } else {
-            sampling_build_truncated_block_fast(row_logits, base, token_domain, cfg, merge_val,
-                                                merge_idx, cand_val, cand_idx, prob, &n_support,
-                                                row_drafts, i);
+            sampling_build_truncated_block_fast(row_logits, base, token_domain, column_cfg,
+                                                merge_val, merge_idx, cand_val, cand_idx, prob,
+                                                &n_support, row_drafts, i);
         }
         if (tid == 0 && done_sh == 0) {
             const int L = L_sh;
@@ -392,7 +444,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     int extent        = current_extents[row];
     extent            = extent < 0 ? 0 : (extent > k ? k : extent);
     if (col > extent) { return; }
-    const SamplingConfig cfg = configs[row];
+    SamplingConfig cfg = configs[row];
+    // The grammar mask licenses only the first verify position.
+    if (col != 0) { cfg.token_mask = nullptr; }
     const bool greedy        = !(cfg.temperature > 0.0f);
     const bool penalties     = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
     if ((greedy && !penalties) || token_domain <= kSamplerTileItems) { return; }
@@ -409,7 +463,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     const std::int64_t base        = (static_cast<std::int64_t>(row) * cols + col) * physical_rows;
     const std::int32_t* row_drafts = drafts + row * k;
     const int tile_start           = partial * kSamplerPartialTileItems;
-    if (!penalties) {
+    // The raw BF16 tile keys cannot express the token mask; a masked first column
+    // falls back to the FP32 adjusted-logit keys below.
+    if (!penalties && cfg.token_mask == nullptr) {
         unsigned int keys[kSamplerItemsPerThread];
 #pragma unroll
         for (int item = 0; item < kSamplerItemsPerThread; ++item) {
@@ -456,12 +512,13 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
 
 template <bool SparseProposal>
 __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group_finalize_kernel(
-    const std::int32_t* target_tokens, const std::int32_t* drafts,
+    const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
     const std::int32_t* candidate_ids, const float* proposal_q, const std::int32_t* current_extents,
     std::int32_t* lengths, std::int32_t* anchors, std::int32_t* licensed_tokens,
     std::int32_t* licensed_counts, std::int32_t* accepted, const SamplingConfig* configs,
-    std::int32_t token_domain, std::int32_t cols, std::int32_t partial_blocks,
-    std::int32_t group_count, SamplingWorkspace workspace, std::size_t workspace_row_stride) {
+    std::int32_t token_domain, std::int32_t physical_rows, std::int32_t cols,
+    std::int32_t partial_blocks, std::int32_t group_count, SamplingWorkspace workspace,
+    std::size_t workspace_row_stride) {
     const int row   = static_cast<int>(blockIdx.z);
     const int group = static_cast<int>(blockIdx.x);
     const int col   = static_cast<int>(blockIdx.y);
@@ -474,22 +531,36 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     const std::int32_t* row_targets = target_tokens + row * cols;
     const std::int32_t* row_drafts  = drafts + row * k;
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
+    const __nv_bfloat16* row_logits =
+        logits + static_cast<std::int64_t>(row) * cols * physical_rows;
     if (token_domain <= kSamplerTileItems) { return; }
     const bool greedy    = !(cfg.temperature > 0.0f);
     const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
 
+    __shared__ float greedy_val[kSamplerGroupBlock];
+    __shared__ int greedy_idx[kSamplerGroupBlock];
+
     if (greedy && !penalties) {
+        // The grammar mask replaces the precomputed raw target only at the first
+        // verify position; later columns keep the unmasked target fast path.
+        int first_target = row_targets[0];
+        if (col == 0 && group == 0 && cfg.token_mask != nullptr) {
+            first_target = speculative_masked_argmax(row_logits, token_domain, cfg, greedy_val,
+                                                     greedy_idx);
+        }
         if constexpr (SparseProposal) {
             if (tid < 32 && col == 0 && group == 0)
                 speculative_sparse_warp_greedy(target_tokens, drafts, lengths, anchors,
                                                licensed_tokens, licensed_counts, accepted, row,
-                                               extent, k);
+                                               extent, k, first_target);
         } else {
 
             if (tid == 0 && col == 0 && group == 0) {
                 int a = 0;
-                while (a < extent && row_targets[a] == row_drafts[a]) { ++a; }
-                const int t_star = row_targets[a];
+                while (a < extent && (a == 0 ? first_target : row_targets[a]) == row_drafts[a]) {
+                    ++a;
+                }
+                const int t_star = a == 0 ? first_target : row_targets[a];
                 speculative_store_accept_result<!SparseProposal>(row_drafts, k, row, a, t_star,
                                                                  lengths, anchors, row_tokens,
                                                                  licensed_counts, accepted, &cfg);

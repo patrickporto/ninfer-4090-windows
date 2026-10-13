@@ -10,8 +10,9 @@
 namespace ninfer::ops {
 
 struct SpeculativeAcceptExecutionEnvelope {
-    // Execution promise: every row has temperature<=0 and both penalties disabled. When false,
-    // the general route remains valid for any supported mixture of greedy and stochastic rows.
+    // Execution promise: every row has temperature<=0, both penalties disabled, and no
+    // token_mask. When false, the general route remains valid for any supported mixture of
+    // greedy and stochastic rows, with or without grammar masks.
     bool all_rows_greedy_without_penalties = false;
 };
 
@@ -146,8 +147,9 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *   inputs remain unchanged.
  *
  * Execution:
- *   all_rows_greedy_without_penalties=true promises the matching device configs and enables the
- *   raw target_tokens route. A false flag selects the general route and supports mixed rows.
+ *   all_rows_greedy_without_penalties=true promises the matching device configs (greedy, no
+ *   penalties, token_mask==null on every row) and enables the raw target_tokens route, which
+ *   cannot apply grammar masks. A false flag selects the general route and supports mixed rows.
  *
  * Workspace:
  *   Caller-owned transient storage reported by

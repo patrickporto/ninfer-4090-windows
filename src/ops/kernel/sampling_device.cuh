@@ -236,6 +236,14 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
     return col * kSamplerCandidateCap + j;
 }
 
+// True when token v is licensed by the optional grammar/structured-output bitset.
+// A null mask licenses every token.
+__device__ __forceinline__ bool sampling_token_allowed(int v, const SamplingConfig& c) {
+    return c.token_mask == nullptr ||
+           (c.token_mask[static_cast<unsigned int>(v) >> 5] &
+            (1U << (static_cast<unsigned int>(v) & 31U))) != 0U;
+}
+
 // Applies presence/frequency penalties to a raw logit. `overlay`/`overlay_len`
 // carry a round-local count overlay: tokens already committed earlier in the
 // current speculative round but not yet flushed to the global `token_counts`. For speculative
@@ -244,9 +252,11 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 // the penalty at each column sees the same prefix a per-token sampler would.
 // Non-speculative callers pass no overlay. The scan is bounded by k and
 // only runs when penalties are active, so it is free on the no-penalty path.
+// A token rejected by the token mask behaves as if its adjusted logit were -inf.
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
+    if (!sampling_token_allowed(v, c)) { return -CUDART_INF_F; }
     float x = raw;
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
     int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;

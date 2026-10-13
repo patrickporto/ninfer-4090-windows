@@ -22,6 +22,11 @@ enum SamplePurpose : std::int32_t {
 
 // Device-resident sampling parameters. token_counts is an optional device I32
 // [token_domain] committed generated-token occurrence-count array used by both penalties.
+// token_mask is an optional device ceil(token_domain/32) uint32 bitset: token v is
+// licensed only when bit (v & 31) of word (v >> 5) is set; masked-out tokens are excluded
+// from every greedy and stochastic selection as if their adjusted logit were -inf.
+// disable_speculation is opaque to the sampling kernels (they never branch on it); the
+// runtime uses it to suppress speculative drafting for grammar-constrained rows.
 struct SamplingConfig {
     float temperature          = 0.0f; // <= 0 => greedy argmax (bit-identical to argmax())
     std::int32_t top_k         = 20;   // runtime contract is [1,20]; Op defensively caps otherwise
@@ -31,6 +36,8 @@ struct SamplingConfig {
     float frequency_penalty    = 0.0f;
     unsigned long long seed    = 0;
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
+    const std::uint32_t* token_mask = nullptr; // device ceil(token_domain/32) bitset, or null
+    bool disable_speculation = false;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -56,6 +63,10 @@ struct SamplingConfig {
  *                - configs[b].presence_penalty * (c_v > 0)
  *                - configs[b].frequency_penalty * c_v.
  *
+ * When configs[b].token_mask is non-null, tokens whose bit is clear behave as if
+ * adjusted_v were -inf: they are never selected by the greedy argmax, never enter the
+ * truncated candidate set, and carry zero weight in the stochastic support.
+ *
  * A greedy row selects min argmax_v adjusted_v and skips filters and RNG. Candidates for a
  * positive-temperature row are sorted by adjusted_v descending with lower token id breaking
  * ties. Per-row top_k
@@ -70,8 +81,9 @@ struct SamplingConfig {
  * compact row index. In every mode the selected token atomically increments
  * configs[b].token_counts when it is non-null. Non-null token-count arrays belonging to distinct
  * active requests must not alias. `out` must not overlap logits, configs, logical_positions, or any
- * token-count array. The Op writes all of out, uses caller-owned transient storage reported by
- * sampling_workspace_capacity_bytes(), and has no other persistent-state side effect.
+ * token-count array, or any token-mask bitset. The Op writes all of out, uses caller-owned
+ * transient storage reported by sampling_workspace_capacity_bytes(), and has no other
+ * persistent-state side effect.
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,

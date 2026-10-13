@@ -31,7 +31,8 @@ __launch_bounds__(kSamplerBlock) __global__
         const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
         if (!penalties) {
             for (int v = tid; v < token_domain; v += blockDim.x) {
-                const float x = __bfloat162float(logits[base + v]);
+                const float raw = __bfloat162float(logits[base + v]);
+                const float x   = sampling_token_allowed(v, cfg) ? raw : -CUDART_INF_F;
                 if (sampling_better(x, v, bv, bi)) {
                     bv = x;
                     bi = v;
@@ -126,7 +127,8 @@ __launch_bounds__(kSamplerBlock) __global__
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
             const float raw = __bfloat162float(logits[base + v]);
-            const float x   = penalties ? sampling_adjusted_logit(raw, v, cfg) : raw;
+            const float x   = penalties ? sampling_adjusted_logit(raw, v, cfg)
+                                        : (sampling_token_allowed(v, cfg) ? raw : -CUDART_INF_F);
             keys[item]      = sampling_sort_key(x, v);
         } else {
             keys[item] = 0ull;
