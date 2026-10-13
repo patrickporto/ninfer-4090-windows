@@ -14,6 +14,8 @@ endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
+include(FetchContent)
+
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
@@ -99,6 +101,37 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
   # not configure or link it.
   add_subdirectory(third_party/spdlog)
 endif()
+
+# XGrammar provides the tokenizer-aware automaton used by structured generation. Define the
+# library locally instead of adding its top-level project: upstream's project-wide compiler flags
+# must not leak into NInfer's CUDA build.
+FetchContent_Declare(
+  xgrammar_source
+  GIT_REPOSITORY https://github.com/mlc-ai/xgrammar.git
+  GIT_TAG v0.2.5.post1
+  GIT_SHALLOW TRUE
+  GIT_SUBMODULES 3rdparty/dlpack
+)
+FetchContent_GetProperties(xgrammar_source)
+if(NOT xgrammar_source_POPULATED)
+  cmake_policy(PUSH)
+  cmake_policy(SET CMP0169 OLD)
+  FetchContent_Populate(xgrammar_source)
+  cmake_policy(POP)
+endif()
+file(GLOB_RECURSE NINFER_XGRAMMAR_SOURCES CONFIGURE_DEPENDS
+  "${xgrammar_source_SOURCE_DIR}/cpp/*.cc")
+list(FILTER NINFER_XGRAMMAR_SOURCES EXCLUDE REGEX "/cpp/tvm_ffi/.*\\.cc$")
+add_library(ninfer_xgrammar STATIC ${NINFER_XGRAMMAR_SOURCES})
+target_compile_features(ninfer_xgrammar PUBLIC cxx_std_20)
+target_compile_definitions(ninfer_xgrammar PUBLIC
+  XGRAMMAR_ENABLE_CPPTRACE=0
+  XGRAMMAR_ENABLE_INTERNAL_CHECK=0)
+target_include_directories(ninfer_xgrammar
+  PUBLIC "${xgrammar_source_SOURCE_DIR}/include"
+  SYSTEM PUBLIC
+    "${xgrammar_source_SOURCE_DIR}/3rdparty/picojson"
+    "${xgrammar_source_SOURCE_DIR}/3rdparty/dlpack/include")
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)
