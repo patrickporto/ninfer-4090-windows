@@ -9158,10 +9158,16 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
                 throw std::logic_error(
                     "active cancellation overlaps the global context transaction");
             }
+            // A grammar-constrained lane may commit a partial non-terminal prefix: the mask
+            // covers only the first speculative position, so the Frontend can reject a later
+            // draft mid-round. resolve_pending_raw re-validates the same relaxation.
+            const bool grammar_constrained =
+                !decision.cancelled && requests[lane].sampling_host.token_mask != nullptr;
             if ((decision.cancelled && (decision.accepted_tokens != 0 || !decision.terminal)) ||
                 (!decision.cancelled &&
                  (decision.accepted_tokens == 0 || decision.accepted_tokens > candidate.produced ||
-                  (!decision.terminal && decision.accepted_tokens != candidate.produced))) ||
+                  (!decision.terminal && decision.accepted_tokens != candidate.produced &&
+                   !grammar_constrained))) ||
                 (decision.prefix_execution_split_after &&
                  (decision.cancelled || *decision.prefix_execution_split_after == 0 ||
                   *decision.prefix_execution_split_after > decision.accepted_tokens))) {
