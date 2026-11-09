@@ -85,7 +85,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cmake --build build-windows --parallel
+          cmake --build build-windows --parallel -- -k 0
 
       - name: Package
         shell: pwsh
@@ -132,7 +132,7 @@ jobs:
             -DNINFER_ENABLE_PDF=ON
 
       - name: Build
-        run: cmake --build build-linux --parallel "$(nproc)"
+        run: cmake --build build-linux --parallel "$(nproc)" -- -k 0
 
       - name: Package
         run: bash scripts/package-release.sh "${{ needs.version.outputs.tag }}" build-linux linux-x64-ubuntu24.04

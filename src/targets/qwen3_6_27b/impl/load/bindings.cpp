@@ -745,7 +745,7 @@ LoadedModelData::LoadedModelData(const OwnerBindingPlan& owner, const TensorRank
     std::size_t gdn_index  = 0;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         const TensorLayerBindingPlan& source = rank.layers[layer];
-        const auto norm = [&](artifact::ObjectHandle handle, std::uint64_t width) {
+        const auto norm = [&](artifact::ObjectHandle handle, std::int32_t width) {
             return artifact::materialized_tensor(backing, handle, F::BF16, {width});
         };
         DensePostMixerPayload mlp{
