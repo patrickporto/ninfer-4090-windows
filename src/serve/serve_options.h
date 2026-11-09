@@ -54,6 +54,9 @@ struct ServeOptions {
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
+    // --parallel pipeline|tensor with --devices A,B (rank order) and, for pipeline,
+    // --pipeline-split N (layers [0,N) on A, [N,64) on B). Single when unset.
+    PlacementOptions placement;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;

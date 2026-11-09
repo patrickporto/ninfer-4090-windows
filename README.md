@@ -365,6 +365,12 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   over-limit image fails as `media_budget_exceeded` instead of reaching an undersized encoder.
   The aggregate budget over all images in a request stays at upstream's 32768 tokens.
 
+- **Two-GPU pipeline and tensor parallelism.** `--parallel pipeline|tensor --devices A,B` runs
+  Qwen3.8-27B across two GPUs, including mixed sm_89/sm_120 pairs without P2P. TP2 decodes
+  ~30% faster than one RTX 4090 without MTP; details and limits in
+  [docs/multi-gpu.md](docs/multi-gpu.md).
+- **PDF input.** Chat requests may attach PDFs; text is extracted locally (poppler, Linux builds).
+
 ## Known limits on the RTX 4090
 
 - Prefill trails llama.cpp by 16-24% on full 32K-128K prompts under matched conditions (see

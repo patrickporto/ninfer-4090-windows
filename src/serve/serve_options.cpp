@@ -86,6 +86,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--request-log-jsonl FILE] [--slot-save-path DIR] [--auto-save-evicted] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] "
+           "[--parallel single|pipeline|tensor --devices A,B [--pipeline-split N]] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
@@ -147,6 +148,8 @@ std::string serve_usage_text(const char* argv0) {
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
+    std::vector<int> parallel_devices;
+    std::optional<std::uint32_t> pipeline_split;
     ServeOptions options;
     options.startup_argv.reserve(static_cast<std::size_t>(argc));
     bool redact_next = false;
@@ -307,6 +310,24 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
+        } else if (arg == "--parallel") {
+            const std::string mode = require_value("--parallel");
+            if (mode == "single") options.placement.mode = ParallelMode::Single;
+            else if (mode == "pipeline") options.placement.mode = ParallelMode::Pipeline;
+            else if (mode == "tensor") options.placement.mode = ParallelMode::Tensor;
+            else throw std::invalid_argument("--parallel must be single, pipeline or tensor");
+        } else if (arg == "--devices") {
+            const std::string list = require_value("--devices");
+            const auto comma       = list.find(',');
+            if (comma == std::string::npos || list.find(',', comma + 1) != std::string::npos) {
+                throw std::invalid_argument("--devices must name exactly two ordinals: A,B");
+            }
+            const std::string first = list.substr(0, comma), second = list.substr(comma + 1);
+            parallel_devices = {parse_nonnegative_int(first.c_str(), "devices"),
+                                parse_nonnegative_int(second.c_str(), "devices")};
+        } else if (arg == "--pipeline-split") {
+            pipeline_split = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--pipeline-split"), "pipeline-split"));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {
@@ -418,6 +439,28 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.placement.mode == ParallelMode::Single) {
+        if (!parallel_devices.empty() || pipeline_split) {
+            throw std::invalid_argument("--devices and --pipeline-split require --parallel");
+        }
+    } else {
+        // Rank 0 owns embedding, head and sampling; it is also EngineOptions::device.
+        if (parallel_devices.empty()) parallel_devices = {0, 1};
+        if (parallel_devices[0] == parallel_devices[1]) {
+            throw std::invalid_argument("--devices must name two distinct GPUs");
+        }
+        options.device             = parallel_devices[0];
+        options.placement.devices  = parallel_devices;
+        if (options.placement.mode == ParallelMode::Pipeline) {
+            const std::uint32_t cut = pipeline_split.value_or(36); // qualified 4090+5070 Ti split
+            if (cut == 0 || cut >= 64) {
+                throw std::invalid_argument("--pipeline-split must be in [1,63]");
+            }
+            options.placement.pipeline_layers = {{0, cut}, {cut, 64}};
+        } else if (pipeline_split) {
+            throw std::invalid_argument("--pipeline-split requires --parallel pipeline");
+        }
+    }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");
