@@ -129,7 +129,11 @@ FetchContent_Declare(
 FetchContent_GetProperties(xgrammar_source)
 if(NOT xgrammar_source_POPULATED)
   cmake_policy(PUSH)
-  cmake_policy(SET CMP0169 OLD)
+  # CMP0169 (CMake 3.30+) deprecates single-argument FetchContent_Populate; older CMake
+  # (e.g. 3.28 on Ubuntu 24.04) does not know the policy and allows the call as is.
+  if(POLICY CMP0169)
+    cmake_policy(SET CMP0169 OLD)
+  endif()
   FetchContent_Populate(xgrammar_source)
   cmake_policy(POP)
 endif()
