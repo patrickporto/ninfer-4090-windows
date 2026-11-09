@@ -99,6 +99,9 @@ DeviceArena& MaterializedArtifact::device_arena() {
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
                                  DeviceContext& device, const StartupObserver* startup_observer) {
+    // Scope precedes every CUDA owner so allocations, copies, events and exceptional
+    // cleanup use the requested context even when the caller has another device bound.
+    const ScopedDevice device_scope(device.device);
     const StartupObserver no_startup_observer;
     const StartupObserver& startup =
         startup_observer == nullptr ? no_startup_observer : *startup_observer;

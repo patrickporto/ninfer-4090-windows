@@ -20,7 +20,7 @@
 
 Generation purpose 的 NInfer Engine 固定运行：
 
-- 一张 GPU；
+- 默认一张 GPU；显式 PP2/TP2 placement 的范围与准入见下文；
 - 一个常驻模型实例；
 - 启动时确定的 `max_concurrency=1..8`；
 - 一个有界 FIFO 等待队列；
@@ -43,9 +43,43 @@ checkpoint 或 cache replica，也不进入 Scheduler/ResourceManager。Generati
 证明其完整执行资源已经得到保障后才会进入 Active；进入 Active 后，它不会因为另一个请求或
 inactive cache 的保留而丢失完成能力。
 
-本文不覆盖多 GPU placement、active request preemption、priority/QoS、跨 Engine context store
+本文不覆盖 active request preemption、priority/QoS、跨 Engine context store
 或大规模 continuous batching。这些工作负载需要重新定义 admission 与公平性合同，不能直接从当前
 小并发模型外推。
+
+### 1.1 Explicit PP2/TP2 placement contract
+
+`EngineOptions::placement` is startup-fixed. `Single` remains the default: both placement
+vectors must be empty and `EngineOptions::device` is the sole device selection. `Pipeline`
+and `Tensor` require exactly two distinct, nonnegative CUDA ordinals in rank order; rank zero
+must equal `EngineOptions::device`, the coordinator. A conflicting scalar and rank list is an
+error, never an implicit override. Device existence and memory feasibility are separate Core
+and Program checks after CPU placement validation.
+
+The initial multi-device identity is exclusively `qwen3.8-27b/groupwise-int`. NVFP4, MoE,
+other target identities and DFlash/DFlash2 are rejected before device allocation. The 27B
+package owns the closed immutable `ParallelPlan`; neither artifact framing nor Core derives
+model partitions. This descriptor establishes geometry, not runtime qualification. MTP,
+Vision, eager execution and CUDA Graph support each require their later implementation and
+parity checks; accepting a geometry must not silently enable an unfinished execution route.
+
+Pipeline placement explicitly supplies `[0,cut)` and `[cut,64)` with `cut` in `1..63`.
+Missing, overlapping, empty or noncovering physical layer ranges are invalid. Every cut is
+between complete decoder blocks. Per-stage tables map local attention/GDN indices to global
+store indices and physical decoder indices; local store indices cannot be inferred from
+stage-relative layer numbers. In particular, stage `[36,64)` has 7 attention and 21 GDN
+layers, beginning at global attention index 9 and GDN index 27 respectively.
+
+Tensor placement specifies no pipeline ranges. Each rank spans all 64 layers and owns 12 Q
+heads, 2 KV heads, 8 GDN Q/K heads, 24 GDN V heads and 8704 MLP channels. Explicit typed
+local/global head maps preserve complete GQA groups of six Q heads per KV head and GDN
+groups of three V heads per Q/K head. MLP partitions are K128 aligned. TP degrees other
+than two and combined TP×PP are outside this contract.
+
+One Engine coordinator and one logical Program retain request order, resource transactions,
+accepted-prefix decisions and publication ownership. Physical ranks do not gain independent
+Frontend, grammar, RNG or checkpoint publication authority. Allocation must follow validated
+placement; startup capability checks must reject execution combinations not yet qualified.
 
 ---
 

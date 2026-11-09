@@ -2,7 +2,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <iosfwd>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::perplexity {
@@ -17,6 +20,14 @@ struct WindowPlan {
 
 [[nodiscard]] std::vector<WindowPlan> plan_windows(std::size_t tokens, std::uint32_t context,
                                                    std::uint32_t stride);
+
+// One JSON line per scored target, using its zero-based position in the original stream.
+void write_token_nll(std::ostream& output, std::string_view stream_id, const WindowPlan& window,
+                     std::span<const float> logprobs);
+
+// Reject aliases of any input or reserved report file before opening the export for truncation.
+void validate_token_nll_destination(const std::filesystem::path& destination,
+                                    std::span<const std::filesystem::path> protected_paths);
 
 struct ScoreAggregate {
     std::uint64_t scored_tokens = 0;

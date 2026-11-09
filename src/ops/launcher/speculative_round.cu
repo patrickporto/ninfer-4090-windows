@@ -89,13 +89,14 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
     speculative_sampling_group_finalize_kernel<false>
         <<<batched_group_grid, kSamplerGroupBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(target_tokens.data),
+            static_cast<const __nv_bfloat16*>(logits.data),
             static_cast<const std::int32_t*>(drafts.data), nullptr, nullptr,
             static_cast<const std::int32_t*>(current_extents.data),
             static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
             static_cast<std::int32_t*>(licensed_tokens.data),
             static_cast<std::int32_t*>(licensed_counts.data),
-            static_cast<std::int32_t*>(accepted.data), configs, token_domain, cols, partial_blocks,
-            groups, scratch, layout.bytes);
+            static_cast<std::int32_t*>(accepted.data), configs, token_domain, physical_rows, cols,
+            partial_blocks, groups, scratch, layout.bytes);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -136,6 +137,7 @@ void speculative_accept_sparse_drafts_launch(
 
     speculative_sampling_group_finalize_kernel<true><<<group_grid, kSamplerGroupBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(target_tokens.data),
+        static_cast<const __nv_bfloat16*>(logits.data),
         static_cast<const std::int32_t*>(drafts.data),
         static_cast<const std::int32_t*>(candidate_ids.data),
         static_cast<const float*>(proposal_q.data),
@@ -144,8 +146,8 @@ void speculative_accept_sparse_drafts_launch(
         static_cast<std::int32_t*>(round_anchors.data),
         static_cast<std::int32_t*>(licensed_tokens.data),
         static_cast<std::int32_t*>(licensed_counts.data),
-        static_cast<std::int32_t*>(accepted_drafts.data), configs, token_domain, cols,
-        partial_blocks, groups, scratch, layout.bytes);
+        static_cast<std::int32_t*>(accepted_drafts.data), configs, token_domain, logits.ne[0],
+        cols, partial_blocks, groups, scratch, layout.bytes);
 
     CUDA_CHECK(cudaGetLastError());
 }

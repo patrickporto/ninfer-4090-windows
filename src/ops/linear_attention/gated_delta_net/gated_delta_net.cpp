@@ -23,6 +23,14 @@ struct Geometry {
     std::int32_t tokens;
 };
 
+// Closed 27B prefill profile qualified against the independent FP64 recurrence.
+// Keep this decision shared by dispatch and workspace accounting; smaller partial
+// chunks still use the existing chunked route and can require more workspace.
+constexpr bool uses_direct_prefill(Geometry geometry, bool normalize_qk) noexcept {
+    return normalize_qk && geometry.qk_heads == 16 && geometry.value_heads == 48 &&
+           geometry.tokens == 1024;
+}
+
 void require_dtype(const Tensor& t, DType dtype, const char* name) {
     if (t.dtype != dtype) { throw std::invalid_argument(std::string("gated_delta_net: ") + name); }
 }
@@ -180,6 +188,7 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t q
                                             std::int32_t value_heads, std::int32_t tokens,
                                             bool normalize_qk) {
     ChunkedWorkspace out;
+    if (uses_direct_prefill({qk_heads, value_heads, tokens}, normalize_qk)) { return out; }
     const std::int32_t full =
         (tokens / detail::gated_delta_net::kChunkSize) * detail::gated_delta_net::kChunkSize;
     if (full == 0) { return out; }
@@ -204,8 +213,16 @@ std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
         max_tokens < min_tokens) {
         throw std::invalid_argument("gated_delta_net workspace: invalid profile or interval");
     }
+    // Chunked capacity is monotonic except at the single direct-prefill point.
+    // An interval ending there must retain its shorter chunk witness (T=1023),
+    // while an exact singleton query reflects the direct route's zero scratch.
+    std::int32_t witness = max_tokens;
+    if (min_tokens < max_tokens &&
+        uses_direct_prefill({qk_heads, value_heads, max_tokens}, normalize_qk)) {
+        --witness;
+    }
     WorkspaceLayoutBuilder layout;
-    (void)allocate_chunked_workspace(layout, qk_heads, value_heads, max_tokens, normalize_qk);
+    (void)allocate_chunked_workspace(layout, qk_heads, value_heads, witness, normalize_qk);
     return layout.peak_bytes(1);
 }
 
@@ -243,6 +260,11 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                      cudaStream_t stream) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
+    if (uses_direct_prefill({q.ne[1], v.ne[1], q.ne[2]}, normalize_qk)) {
+        detail::gated_delta_net::launch_recurrent_inout(q, k, v, g, beta, scale, normalize_qk,
+                                                       ssm_state_in, ssm_state_out, out, stream);
+        return;
+    }
 
     auto scratch_scope   = ws.scope();
     const std::int32_t T = q.ne[2];

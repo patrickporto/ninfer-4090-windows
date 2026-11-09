@@ -15,7 +15,6 @@
 
 namespace ninfer::ops::detail::gated_delta_net::chunked::prepare_wy_wu {
 
-using ninfer::ops::mma_tf32;
 using ninfer::ops::Cache;
 using ninfer::ops::cp_async;
 using ninfer::ops::cp_commit;
@@ -134,8 +133,8 @@ __device__ __forceinline__ void mma16_raw_x_swiz(float D[8], int lane,
             const int n_off = nt * MMA_N;
             const float b0  = M_view.at(M_row_off + k_off + lane_t, M_col_off + n_off + lane_g);
             const float b1  = M_view.at(M_row_off + k_off + lane_t + 4, M_col_off + n_off + lane_g);
-            mma_tf32(D[nt * 4 + 0], D[nt * 4 + 1], D[nt * 4 + 2], D[nt * 4 + 3], a0, a1, a2, a3, b0,
-                     b1);
+            mma_tf32_rounded(D[nt * 4 + 0], D[nt * 4 + 1], D[nt * 4 + 2], D[nt * 4 + 3], a0, a1,
+                             a2, a3, b0, b1);
         }
     }
 }
@@ -158,8 +157,8 @@ __device__ __forceinline__ void mma16_swiz_x_raw(float D[8], int lane, SmemTile<
             const int n_off = nt * MMA_N;
             const float b0  = B_buf[(k_off + lane_t) * SCR_STRIDE + (n_off + lane_g)];
             const float b1  = B_buf[(k_off + lane_t + 4) * SCR_STRIDE + (n_off + lane_g)];
-            mma_tf32(D[nt * 4 + 0], D[nt * 4 + 1], D[nt * 4 + 2], D[nt * 4 + 3], a0, a1, a2, a3, b0,
-                     b1);
+            mma_tf32_rounded(D[nt * 4 + 0], D[nt * 4 + 1], D[nt * 4 + 2], D[nt * 4 + 3], a0, a1,
+                             a2, a3, b0, b1);
         }
     }
 }
@@ -306,7 +305,7 @@ compute_store_wu_panel(SmemTile<BT> T_view, SmemTile<WU_PANEL_COLS> panel,
             const int col  = warp_panel_col + n * MMA_N + lane_g;
             const float b0 = panel.at(row_t0, col);
             const float b1 = panel.at(row_t1, col);
-            mma_tf32(D[n][0], D[n][1], D[n][2], D[n][3], a0, a1, a2, a3, b0, b1);
+            mma_tf32_rounded(D[n][0], D[n][1], D[n][2], D[n][3], a0, a1, a2, a3, b0, b1);
         }
     }
 

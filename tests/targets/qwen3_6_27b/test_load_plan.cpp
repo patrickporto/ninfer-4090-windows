@@ -87,8 +87,8 @@ int verify_groupwise(const std::filesystem::path& path) {
         std::cerr << "groupwise materialization plan is incomplete\n";
         return 1;
     }
-    if (plan.bindings.token_embedding.format != NumericFormat::Q6G64_F16S ||
-        plan.bindings.output_head.format != NumericFormat::Q6G64_F16S) {
+    if (plan.bindings.owner.token_embedding.format != NumericFormat::Q6G64_F16S ||
+        plan.bindings.owner.output_head.format != NumericFormat::Q6G64_F16S) {
         std::cerr << "groupwise vocabulary endpoints have the wrong storage profile\n";
         return 1;
     }
@@ -134,8 +134,8 @@ int verify_nvfp4(const std::filesystem::path& path) {
                   << " host=" << plan.materialization.host_objects.size() << '\n';
         return 1;
     }
-    if (plan.bindings.token_embedding.format != NumericFormat::W8G32_F16S ||
-        plan.bindings.output_head.format != NumericFormat::W8G32_F16S) {
+    if (plan.bindings.owner.token_embedding.format != NumericFormat::W8G32_F16S ||
+        plan.bindings.owner.output_head.format != NumericFormat::W8G32_F16S) {
         std::cerr << "NVFP4 vocabulary endpoints have the wrong storage profile\n";
         return 1;
     }
@@ -195,7 +195,7 @@ int verify_legacy_dflash2_compatibility(const std::filesystem::path& path, Weigh
         ninfer::artifact::Binder binder(reader);
         const ArtifactLoadPlan plan =
             bind_artifact(binder, profile, features(ninfer::SpeculativeBackend::None));
-        if (plan.bindings.dflash2 || dflash2_device_objects(reader, plan.materialization) != 0) {
+        if (plan.bindings.owner.dflash2 || dflash2_device_objects(reader, plan.materialization) != 0) {
             std::cerr << "legacy artifact unexpectedly bound DFlash2: " << path << '\n';
             return 1;
         }
@@ -205,8 +205,8 @@ int verify_legacy_dflash2_compatibility(const std::filesystem::path& path, Weigh
         ninfer::artifact::Binder binder(reader);
         const ArtifactLoadPlan plan =
             bind_artifact(binder, profile, features(ninfer::SpeculativeBackend::Mtp));
-        if (plan.bindings.dflash2 ||
-            !is_device_object(plan.materialization, plan.bindings.mtp.input_projection)) {
+        if (plan.bindings.owner.dflash2 ||
+            !is_device_object(plan.materialization, plan.bindings.owner.mtp.input_projection)) {
             std::cerr << "legacy artifact did not preserve MTP-only binding: " << path << '\n';
             return 1;
         }
@@ -230,12 +230,12 @@ int verify_dflash2_bundle(const std::filesystem::path& path, WeightsProfile prof
         ninfer::artifact::Reader reader(path);
         ninfer::artifact::Binder binder(reader);
         const ArtifactLoadPlan plan = bind_artifact(binder, profile, features(backend));
-        if (!plan.bindings.dflash2 || dflash2_device_objects(reader, plan.materialization) != 0) {
+        if (!plan.bindings.owner.dflash2 || dflash2_device_objects(reader, plan.materialization) != 0) {
             std::cerr << "inactive DFlash2 bundle was not validate-only: " << path << '\n';
             return 1;
         }
         const bool mtp_is_device =
-            is_device_object(plan.materialization, plan.bindings.mtp.input_projection);
+            is_device_object(plan.materialization, plan.bindings.owner.mtp.input_projection);
         if (mtp_is_device != (backend == ninfer::SpeculativeBackend::Mtp)) {
             std::cerr << "MTP placement does not match backend selection: " << path << '\n';
             return 1;
@@ -247,10 +247,10 @@ int verify_dflash2_bundle(const std::filesystem::path& path, WeightsProfile prof
     const ArtifactLoadPlan plan = bind_artifact(
         binder, profile,
         features(ninfer::SpeculativeBackend::DFlash2, ninfer::ProposalHead::Optimized));
-    if (!plan.bindings.dflash2 || dflash2_device_objects(reader, plan.materialization) != 66 ||
-        is_device_object(plan.materialization, plan.bindings.mtp.input_projection) ||
-        !is_device_object(plan.materialization, plan.bindings.draft_head) ||
-        !is_device_object(plan.materialization, plan.bindings.draft_head_token_ids)) {
+    if (!plan.bindings.owner.dflash2 || dflash2_device_objects(reader, plan.materialization) != 66 ||
+        is_device_object(plan.materialization, plan.bindings.owner.mtp.input_projection) ||
+        !is_device_object(plan.materialization, plan.bindings.owner.draft_head) ||
+        !is_device_object(plan.materialization, plan.bindings.owner.draft_head_token_ids)) {
         std::cerr << "selected DFlash2 bundle has the wrong placement: " << path << '\n';
         return 1;
     }

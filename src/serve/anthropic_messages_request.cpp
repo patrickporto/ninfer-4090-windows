@@ -1,3 +1,4 @@
+#include "serve/document_input.h"
 #include "serve/anthropic_messages.h"
 #include "serve/request_validation.h"
 
@@ -280,9 +281,22 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content) {
         } else if (type == "tool_result") {
             result.emplace_back(parse_tool_result(block));
         } else if (type == "document") {
-            bad_request("document blocks require document and citation semantics that NInfer does "
-                        "not provide",
-                        "messages", "documents_not_supported");
+            ContentPart part;
+            part.kind = ContentKind::Document;
+            part.type_raw = "document";
+            part.source = parse_anthropic_pdf_source(block);
+            for (const char* field : {"title", "context"}) {
+                if (block.contains(field) && !block.at(field).is_null()) {
+                    if (!block.at(field).is_string()) {
+                        bad_request(std::string("document.") + field + " must be a string", "messages");
+                    }
+                    part.text += std::string("[PDF ") + field + "] " + block.at(field).get<std::string>() + "\n";
+                }
+            }
+            if (const auto ttl = cache_boundary(block, "messages")) {
+                part.cache_boundary_after = explicit_cache_boundary(*ttl);
+            }
+            result.emplace_back(std::move(part));
         } else if (type == "search_result") {
             bad_request("search_result blocks require source and citation semantics that NInfer "
                         "does not provide",
@@ -893,15 +907,24 @@ void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose p
     }
 }
 
-void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
+void parse_effort(const Json& body, GenerationRequest& request) {
     if (!body.contains("output_config") || body.at("output_config").is_null()) { return; }
     const Json& config = body.at("output_config");
     if (!config.is_object()) { bad_request("output_config must be an object", "output_config"); }
-    if (purpose == ParsePurpose::Messages && config.contains("format") &&
-        !config.at("format").is_null()) {
-        bad_request("output_config.format requires constrained decoding, which NInfer does not "
-                    "provide",
-                    "output_config.format", "output_config_format_not_supported");
+    if (config.contains("format") && !config.at("format").is_null()) {
+        const Json& format = config.at("format");
+        if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
+            bad_request("output_config.format must be a typed object", "output_config.format");
+        }
+        if (format.at("type").get<std::string>() != "json_schema") {
+            bad_request("output_config.format.type must be 'json_schema'", "output_config.format",
+                        "response_format_type_invalid");
+        }
+        if (!format.contains("schema") || !format.at("schema").is_object()) {
+            bad_request("output_config.format.schema must be an object", "output_config.format");
+        }
+        request.response_format.mode        = ResponseFormatMode::JsonSchema;
+        request.response_format.schema_json = format.at("schema").dump();
     }
     if (!config.contains("effort") || config.at("effort").is_null()) { return; }
     if (!config.at("effort").is_string()) {
@@ -1021,7 +1044,7 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
     parse_system(body, request);
     parse_messages(body, request);
     parse_thinking(body, request, purpose, effective_max_tokens);
-    parse_effort(body, request, purpose);
+    parse_effort(body, request);
     apply_anthropic_prompt_cache_policy(body, request);
     if (body.contains("container") && !body.at("container").is_null()) {
         bad_request("container requires an external execution environment that NInfer does not "

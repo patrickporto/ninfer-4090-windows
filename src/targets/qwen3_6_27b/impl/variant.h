@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ninfer/ops/linear.h"
 #include "core/device.h"
 #include "targets/qwen3_6_27b/impl/config.h"
 #include "ninfer/ops/sparse_moe.h"
@@ -48,6 +49,8 @@ struct Variant {
     static constexpr std::uint32_t maximum_context             = kNativeContext;
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
+    // TP2 rank-local leaves over the offline groupwise-int-tp2 shards (AllowA8 local profiles).
+    static constexpr bool supports_tensor_parallel             = true;
 
     static void attention_projection(const Tensor& hidden,
                                      const FullAttentionProjectionWeights& weights, Tensor& query,
@@ -95,6 +98,26 @@ struct Variant {
                            WorkspaceArena& workspace, cudaStream_t stream);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
+    // Q4 [3584,5120] + Q5 [3584,5120] -> q/gate [3072,T], k/v [512,T].
+    static void tensor_attention_projection(const Tensor& hidden,
+                                            const FullAttentionProjectionWeights& weights,
+                                            Tensor& query, Tensor& gate, Tensor& key,
+                                            Tensor& value, ops::LinearPolicy policy, WorkspaceArena& workspace,
+                                            cudaStream_t stream);
+    // Q4 [2048,5120] + Q5 [6144,5120] -> qkv [5120,T], z [3072,T].
+    static void tensor_gdn_input_projection(const Tensor& hidden,
+                                            const GdnProjectionWeights& weights, Tensor& qkv,
+                                            Tensor& output_gate, ops::LinearPolicy policy, WorkspaceArena& workspace,
+                                            cudaStream_t stream);
+    // Local SwiGLU [8704,T] then row-parallel down into the FP32 partial [5120,T]; no residual.
+    static void tensor_post_mixer(const Tensor& hidden, const PostMixerWeights& weights,
+                                  Tensor& partial, ops::LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
+    [[nodiscard]] static std::size_t
+    tensor_attention_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t
+    tensor_gdn_input_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t tensor_post_mixer_workspace_capacity_bytes(std::int32_t first,
+                                                                                std::int32_t last);
     [[nodiscard]] static std::size_t
     mtp_attention_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,

@@ -452,15 +452,29 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
         std::cerr << geometry.label << ": GDN control interval missed a route endpoint\n";
         ++failures;
     }
-    for (const auto bounds :
-         std::vector<std::pair<int, int>>{{1, 42}, {40, 43}, {1, 128}, {120, 129}, {1, 256}}) {
-        std::size_t witness = 0;
-        for (int t = bounds.first; t <= bounds.second; ++t)
-            witness = std::max(witness, ops::gdn_norm_gating_proj_workspace_capacity_bytes(
-                                            geometry.heads, geometry.hidden, t, t));
-        const auto capacity = ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+    // Check every exact extent against the public enclosure, including an isolated interior
+    // workspace maximum. Endpoint-only sizing cannot establish this contract.
+    for (const auto bounds : std::vector<std::pair<int, int>>{
+             {1, 42}, {40, 43}, {1, 128}, {120, 129}, {1, 256}, {1, 1024}, {1023, 1025}}) {
+        std::size_t plain_witness = 0;
+        std::size_t norm_witness = 0;
+        for (int t = bounds.first; t <= bounds.second; ++t) {
+            plain_witness = std::max(
+                plain_witness, ops::gdn_gating_proj_workspace_capacity_bytes(
+                                   geometry.heads, geometry.hidden, t, t));
+            norm_witness = std::max(
+                norm_witness, ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+                                  geometry.heads, geometry.hidden, t, t));
+        }
+        const auto plain_capacity = ops::gdn_gating_proj_workspace_capacity_bytes(
             geometry.heads, geometry.hidden, bounds.first, bounds.second);
-        if (capacity != witness) {
+        const auto norm_capacity = ops::gdn_norm_gating_proj_workspace_capacity_bytes(
+            geometry.heads, geometry.hidden, bounds.first, bounds.second);
+        if (plain_capacity != plain_witness) {
+            std::cerr << geometry.label << ": control interval missed an extent\n";
+            ++failures;
+        }
+        if (norm_capacity != norm_witness) {
             std::cerr << geometry.label << ": norm/control interval missed an extent\n";
             ++failures;
         }
@@ -471,6 +485,12 @@ int verify_workspace_capacity_contract(const Geometry& geometry,
 } // namespace
 
 int main() {
+    // Capacity is a host contract and must remain checked without a CUDA device.
+    int failures = 0;
+    failures += verify_workspace_capacity_contract(kQwen27,
+                                                   {1, 8, 1023, 1024, 1025, 1280, 2688, 2689});
+    failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
+    if (failures != 0) { return 1; }
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -479,9 +499,6 @@ int main() {
     DeviceContext device;
     const DeviceExecutionView execution{nullptr, device.multiprocessor_count()};
     const DeviceExecutionView norm_execution{device.stream, device.multiprocessor_count()};
-    int failures = 0;
-    failures += verify_workspace_capacity_contract(kQwen27, {1, 8, 1280, 2688, 2689});
-    failures += verify_workspace_capacity_contract(kQwen35, {1, 127, 1024, 2048, 4096, 4097});
 
     // Every registered 27B projection route, including predicated and full token tiles, and both
     // sides of each sm_89 route boundary. T=2689 (the MmaUnsplit onset) is exercised for
@@ -489,7 +506,7 @@ int main() {
     // FP32 accumulation misses the 1.4e-6 relative_l2 criterion by about 1e-5, the same known
     // issue the sm_86 retune documents at its own onset. No serve configuration reaches the
     // unsplit region: the largest legal prefill chunk (2688) still routes to split2.
-    for (const std::int32_t tokens : {1, 8, 9, 1024, 1280, 1281, 2048, 2688, 4097}) {
+    for (const std::int32_t tokens : {1, 8, 9, 1023, 1024, 1025, 1280, 1281, 2048, 2688, 4097}) {
         failures += run_projection_case(kQwen27, tokens,
                                         0x1000u + static_cast<std::uint32_t>(tokens), execution);
     }
@@ -521,7 +538,7 @@ int main() {
     failures += run_norm_projection_case(kQwen35, 64, 0x4040u, norm_execution);
 
     // Requalify the retained BF16-staging profile at every prefill reduction boundary.
-    for (int tokens : {1024, 1025, 2048, 2049, 4097})
+    for (int tokens : {1023, 1024, 1025, 2048, 2049, 4097})
         failures +=
             run_norm_projection_case(kQwen38Parent, tokens, 0x6800u + tokens, norm_execution);
     for (int tokens : {2, 8, 15, 127, 128, 1024, 1025, 2048, 2049, 4097})

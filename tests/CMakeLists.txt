@@ -6,6 +6,39 @@ add_executable(ninfer_public_api_test test_public_api.cpp)
 target_include_directories(ninfer_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 
+# Placement and mathematical references deliberately have no CUDA link dependency.
+add_executable(ninfer_parallel_plan_test
+  parallel/test_plan.cpp
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/impl/parallel_plan.cpp)
+target_include_directories(ninfer_parallel_plan_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME ninfer_parallel_plan_test COMMAND ninfer_parallel_plan_test)
+
+add_executable(ninfer_parallel_math_oracle_test parallel/test_math_oracle.cpp)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(ninfer_parallel_math_oracle_test PRIVATE
+    -fno-fast-math -ffp-contract=off)
+endif()
+add_test(NAME ninfer_parallel_math_oracle_test COMMAND ninfer_parallel_math_oracle_test)
+
+add_executable(ninfer_parallel_pipeline_stage_test parallel/test_pipeline.cpp)
+target_include_directories(ninfer_parallel_pipeline_stage_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+add_test(NAME ninfer_parallel_pipeline_stage_test COMMAND ninfer_parallel_pipeline_stage_test)
+
+# Uses CUDA declaration headers through binding types, but no CUDA runtime linkage.
+add_executable(ninfer_parallel_pipeline_materialization_test
+  parallel/test_pipeline_materialization.cpp
+  ${PROJECT_SOURCE_DIR}/src/artifact/partition.cpp
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/impl/load/pipeline_weights.cpp)
+target_include_directories(ninfer_parallel_pipeline_materialization_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${CUDAToolkit_INCLUDE_DIRS}
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+add_test(NAME ninfer_parallel_pipeline_materialization_test
+  COMMAND ninfer_parallel_pipeline_materialization_test)
+
 function(ninfer_add_test name)
   cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
   add_executable(${name} ${arg_SOURCES})
@@ -28,6 +61,75 @@ function(ninfer_add_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+ninfer_add_test(ninfer_cuda_error_scope_test
+  SOURCES parallel/test_cuda_error_scope.cpp)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  ninfer_add_test(ninfer_cuda_function_config_test
+    SOURCES parallel/test_cuda_function_config.cpp)
+  target_link_options(ninfer_cuda_function_config_test PRIVATE
+    "LINKER:--wrap=cudaGetDevice" "LINKER:--wrap=cudaFuncSetAttribute")
+endif()
+
+# Loading qualification uses CUDA allocations/copies, without inference kernels.
+ninfer_add_test(ninfer_parallel_pipeline_load_views_test
+  SOURCES parallel/test_pipeline_load_views.cpp
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/impl/load/bindings.cpp
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/impl/load/pipeline_weights.cpp
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl/frontend/resources.cpp
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl/vision/bindings.cpp
+  LIBRARIES ninfer_artifact)
+target_include_directories(ninfer_parallel_pipeline_load_views_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+set_tests_properties(ninfer_parallel_pipeline_load_views_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_parallel_tensor_materialization_test
+  SOURCES parallel/test_tensor_materialization.cpp
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/impl/load/tensor_weights.cpp
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/impl/load/bindings.cpp
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl/frontend/resources.cpp
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl/vision/bindings.cpp
+  LIBRARIES ninfer_artifact)
+target_include_directories(ninfer_parallel_tensor_materialization_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+
+ninfer_add_test(ninfer_parallel_pipeline_stage_execution_test
+  SOURCES parallel/test_pipeline_stage_execution.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_parallel_pipeline_stage_execution_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+set_tests_properties(ninfer_parallel_pipeline_stage_execution_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# Internal partition/arithmetic isolation; this is not a parallel performance benchmark.
+ninfer_add_test(ninfer_parallel_partition_diagnostic_test
+  SOURCES parallel/test_pipeline_partition_diagnostic.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_parallel_partition_diagnostic_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
+set_tests_properties(ninfer_parallel_partition_diagnostic_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_parallel_pipeline_test
+  SOURCES parallel/test_pipeline_engine.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+set_tests_properties(ninfer_parallel_pipeline_test PROPERTIES SKIP_RETURN_CODE 77)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_definitions(ninfer_parallel_pipeline_test PRIVATE NINFER_TEST_PIPELINE_FAULT_WRAP=1)
+  target_link_options(ninfer_parallel_pipeline_test PRIVATE "LINKER:--wrap=cudaMemsetAsync")
+endif()
+
+# Opt-in public TP2 Engine qualification: NINFER_TEST_TENSOR_ENGINE=1 with both artifacts.
+ninfer_add_test(ninfer_parallel_tensor_engine_test
+  SOURCES parallel/test_tensor_engine.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+set_tests_properties(ninfer_parallel_tensor_engine_test PROPERTIES SKIP_RETURN_CODE 77)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_definitions(ninfer_parallel_tensor_engine_test PRIVATE NINFER_TEST_TENSOR_FAULT_WRAP=1)
+  target_link_options(ninfer_parallel_tensor_engine_test PRIVATE "LINKER:--wrap=cudaMemsetAsync")
+endif()
+
 function(ninfer_add_op_test name)
   ninfer_add_test(${name} ${ARGN})
   set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
@@ -44,6 +146,26 @@ function(ninfer_add_linear_test name source)
             ops/linear/linear_test_common.cpp
     LIBRARIES ninfer_ops)
 endfunction()
+
+ninfer_add_op_test(ninfer_parallel_tensor_projection_test
+  SOURCES parallel/test_tensor_projection.cpp
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_parallel_tensor_attention_test
+  SOURCES parallel/test_tensor_attention.cpp
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_parallel_tensor_mlp_test
+  SOURCES parallel/test_tensor_mlp.cpp
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_parallel_tensor_gdn_test
+  SOURCES parallel/test_tensor_gdn.cpp
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_parallel_collectives_test
+  SOURCES parallel/test_collectives.cpp
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl/runtime/rank_executor.cpp)
 
 function(ninfer_add_fused_linear_test name source common)
   ninfer_add_op_test(${name}
@@ -68,6 +190,18 @@ ninfer_add_test(ninfer_pretty_logging_test
   SOURCES test_pretty_logging.cpp
   LIBRARIES ninfer_product_logging)
 ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
+ninfer_add_op_test(ninfer_parallel_device_group_test
+  SOURCES parallel/test_device_group.cpp)
+ninfer_add_op_test(ninfer_parallel_rank_executor_test
+  SOURCES parallel/test_rank_executor.cpp
+    ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl/runtime/rank_executor.cpp)
+if(UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  ninfer_add_op_test(ninfer_parallel_peer_transfer_test
+    SOURCES parallel/test_peer_transfer.cpp)
+  foreach(symbol cudaMallocHost cudaHostAlloc cudaFreeHost cudaStreamGetDevice cudaMemcpyAsync)
+    target_link_options(ninfer_parallel_peer_transfer_test PRIVATE "LINKER:--wrap=${symbol}")
+  endforeach()
+endif()
 ninfer_add_test(ninfer_decode_graph_test SOURCES test_decode_graph.cpp)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
@@ -448,3 +582,12 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
 
+
+# PDF extraction/rendering is CPU-only and does not require model weights or CUDA execution.
+ninfer_add_test(ninfer_pdf_document_test
+  SOURCES test_pdf_document.cpp
+  LIBRARIES ninfer_pdf_document)
+
+ninfer_add_test(ninfer_pdf_input_test
+  SOURCES test_pdf_input.cpp
+  LIBRARIES ninfer_serve)

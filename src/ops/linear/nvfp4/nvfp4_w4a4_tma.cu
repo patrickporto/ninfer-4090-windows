@@ -1,5 +1,6 @@
 #include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
 
+#include "core/cuda_function_config.h"
 #include "core/device.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -62,13 +63,8 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
         make_nvfp4_w4a4_tma_descriptors<Geometry, Schedule::kBlockM>(
             activation_codes, activation_scales, weight_codes, weight_scales, tokens);
     constexpr std::size_t kSharedBytes = sizeof(Nvfp4W4a4TmaSharedStorage<Schedule>);
-    static const bool kConfigured      = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(nvfp4_w4a4_tma_kernel<Geometry, Schedule, Epilogue, Output>,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                             static_cast<int>(kSharedBytes)));
-        return true;
-    }();
-    (void)kConfigured;
+    configure_cuda_shared_memory(nvfp4_w4a4_tma_kernel<Geometry, Schedule, Epilogue, Output>,
+                                 static_cast<int>(kSharedBytes));
 
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN, tokens / Schedule::kBlockM);
     nvfp4_w4a4_tma_kernel<Geometry, Schedule>

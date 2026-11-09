@@ -786,6 +786,8 @@ int run_nvfp4() {
 
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
+    failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::A16Only, 6);
+    failures += run_nvfp4_case(parent, 128, ops::LinearPolicy::A16Only, 7);
 #ifndef NINFER_SM86
     failures += run_nvfp4_case(parent, 3, ops::LinearPolicy::AllowA4, 4);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);

@@ -25,7 +25,8 @@ namespace ninfer::ops {
                                                                  std::int32_t max_tokens);
 
 /**
- * Policy-bearing capacity query. Q4 admits A16Only/AllowA8; W8 admits A16Only.
+ * Policy-bearing capacity query. Full Q4 admits A16Only/AllowA8; local Q4 admits only AllowA8;
+ * W8 admits A16Only.
  * NVFP4 admits A16Only through T=16 and
  * AllowA4 for every positive T. Row-scaled FP8 admits A16Only and AllowA8 for every positive T.
  * A permissive policy covers whichever qualified route the private resolver selects across the
@@ -46,13 +47,14 @@ linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
  * Logical shapes / supported domain:
  *   T may be any positive value. The registered profiles are:
  *   - Q4G64_F16S weight [34816,5120], x [5120,T], out [17408,T];
+ *   - Q4G64_F16S weight [17408,5120], x [5120,T], out [8704,T], AllowA8 only;
  *   - W8G32_F16S weight [12288,2048], x [2048,T], out [6144,T];
  *   - W8G32_F16S weight [34816,5120], x [5120,T], out [17408,T];
  *   - NVFP4 BlockScaleK16M128x4 weight [34816,5120], x [5120,T], out [17408,T];
  *   - FP8_E4M3FN_ROW_BF16S RowScale weight [34816,5120], x [5120,T], out [17408,T].
  *   Inputs and output are contiguous BF16. Q4/W8 scales are FP16, NVFP4 scales are E4M3FN, and
- *   row-scaled FP8 has one BF16 multiplier per gate/up parent row. Gate rows `[0,17408)` precede
- *   their matching up rows `[17408,34816)`.
+ *   row-scaled FP8 has one BF16 multiplier per gate/up parent row. Gate rows `[0,M)` precede
+ *   their matching up rows `[M,2*M)`.
  *
  * Numeric:
  *   The oracle exact-decodes the registered weight and evaluates `ideal` naively in FP64 from the
@@ -78,7 +80,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                    WorkspaceArena& ws, cudaStream_t stream);
 
 /**
- * A16-only convenience form. Q4/W8 and row-scaled FP8 retain their complete positive-T domain.
+ * A16-only convenience form. The full Q4, W8, and row-scaled FP8 profiles retain their complete
+ * positive-T domain. The local Q4 [17408,5120] profile requires AllowA8 and rejects this form.
  * NVFP4 is admitted only through T=16; larger NVFP4 extents require the policy-bearing AllowA4
  * form.
  */

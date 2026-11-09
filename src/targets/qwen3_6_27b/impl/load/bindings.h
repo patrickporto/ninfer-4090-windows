@@ -137,12 +137,11 @@ struct DFlash2Plan {
     DFlash2CandidateSelectorPlan candidate_selector;
 };
 
-struct BindingPlan {
+struct OwnerBindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
 
     WeightPlan token_embedding;
-    std::array<TextLayerPlan, kTextLayers> text_layers;
     artifact::ObjectHandle final_norm;
     WeightPlan output_head;
     artifact::ObjectHandle draft_head;
@@ -156,6 +155,15 @@ struct BindingPlan {
     artifact::ObjectHandle vision_merger_fc2_bias;
     qwen3_6::VisionMergerNormPlan vision_merger_norm;
 };
+
+// Shared owner roles retain their single-device dimensions under PP and TP.
+struct BindingPlan {
+    OwnerBindingPlan owner;
+    std::array<TextLayerPlan, kTextLayers> text_layers;
+};
+
+OwnerBindingPlan bind_owner_objects(artifact::Binder& binder, WeightsProfile weights_profile,
+                                   qwen3_6::StartupFeatures features);
 
 struct ArtifactLoadPlan {
     BindingPlan bindings;
@@ -229,15 +237,30 @@ using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;
 
+struct PipelineStage {
+    PhysicalLayerRange layers{0, kTextLayers};
+    bool owns_non_decoder = true;
+};
+
+struct TensorRankBindingPlan;
+
 class LoadedModelData {
 public:
-    LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized);
+    LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
+                    std::optional<PipelineStage> stage = std::nullopt);
+    // TP2 rank: all 64 layers with rank-local shard shapes. Rank 0 also owns the frontend,
+    // embedding, final norm and full output head; rank 1 owns no non-decoder object.
+    LoadedModelData(const OwnerBindingPlan& owner, const TensorRankBindingPlan& rank,
+                    artifact::MaterializedArtifact materialized);
 
     LoadedModelData(const LoadedModelData&)            = delete;
     LoadedModelData& operator=(const LoadedModelData&) = delete;
     LoadedModelData(LoadedModelData&&)                 = delete;
     LoadedModelData& operator=(LoadedModelData&&)      = delete;
 
+    // Runtime arrays retain global indices; callers must stay inside this physical range.
+    const std::optional<PipelineStage> pipeline_stage;
+    const std::optional<std::size_t> tensor_rank;
     artifact::MaterializedArtifact backing;
     qwen3_6::FrontendResources frontend;
     RuntimeModelView runtime;
@@ -246,8 +269,11 @@ public:
 class LoadedModel::Impl {
 public:
     Impl(WeightsProfile weights_profile_in, BindingPlan plan,
-         artifact::MaterializedArtifact materialized)
-        : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized)) {}
+         artifact::MaterializedArtifact materialized, std::optional<PipelineStage> stage = std::nullopt)
+        : weights_profile(weights_profile_in), data(std::move(plan), std::move(materialized), stage) {}
+    Impl(WeightsProfile weights_profile_in, const OwnerBindingPlan& owner,
+         const TensorRankBindingPlan& rank, artifact::MaterializedArtifact materialized)
+        : weights_profile(weights_profile_in), data(owner, rank, std::move(materialized)) {}
 
     WeightsProfile weights_profile;
     LoadedModelData data;

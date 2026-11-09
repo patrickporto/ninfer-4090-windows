@@ -4,12 +4,29 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <new>
 
 namespace ninfer {
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
 #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
+
+// Scoped host-thread binding. Cleanup form logs failures and never throws.
+class ScopedDevice {
+public:
+    explicit ScopedDevice(int device);
+    ScopedDevice(int device, std::nothrow_t) noexcept;
+    ~ScopedDevice() noexcept;
+    ScopedDevice(const ScopedDevice&) = delete;
+    ScopedDevice& operator=(const ScopedDevice&) = delete;
+private:
+    int previous_ = -1;
+};
+
+void cuda_require(cudaError_t status, const char* operation);
+// Default stream handles resolve against the calling thread's current device.
+int cuda_stream_device(cudaStream_t stream);
 
 // Non-owning execution facts passed to Ops whose launch policy depends on physical device
 // capacity. DeviceContext remains the owner and authoritative source of both values.
@@ -58,6 +75,7 @@ public:
     float stop_ms();
 
 private:
+    int device_ = 0;
     cudaStream_t stream_ = nullptr;
     cudaEvent_t start_   = nullptr;
     cudaEvent_t stop_    = nullptr;

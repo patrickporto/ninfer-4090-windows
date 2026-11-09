@@ -3,6 +3,7 @@
 #include "product/media_acquire/acquire.h"
 #include <spdlog/logger.h>
 #include "serve/translate.h"
+#include "serve/document_input.h"
 
 #include <algorithm>
 #include <chrono>
@@ -144,7 +145,7 @@ using Clock = std::chrono::steady_clock;
     throw ApiException(std::move(error));
 }
 
-ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point deadline,
+std::vector<std::uint8_t> acquire_source_bytes(const ContentPart& part, Clock::time_point deadline,
                                  const std::function<bool()>& is_cancelled,
                                  std::size_t& remaining_bytes) {
     if (remaining_bytes == 0) {
@@ -154,6 +155,9 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
     }
     ninfer::product::media_acquire::Policy policy;
     policy.max_bytes    = std::min(policy.max_bytes, remaining_bytes);
+    if (part.kind == ContentKind::Document) {
+        policy.max_bytes = std::min(policy.max_bytes, std::size_t{32ULL << 20});
+    }
     policy.deadline     = deadline;
     policy.is_cancelled = is_cancelled;
     std::vector<std::uint8_t> source_bytes;
@@ -166,6 +170,13 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
     }
 
     remaining_bytes -= source_bytes.size();
+    return source_bytes;
+}
+
+ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point deadline,
+                                 const std::function<bool()>& is_cancelled,
+                                 std::size_t& remaining_bytes) {
+    auto source_bytes = acquire_source_bytes(part, deadline, is_cancelled, remaining_bytes);
     ninfer::OwnedMedia media;
     media.kind =
         part.kind == ContentKind::Image ? ninfer::MediaKind::Image : ninfer::MediaKind::Video;
@@ -350,8 +361,14 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         const auto acquisition_started = Clock::now();
         std::size_t remaining_media_bytes =
             std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
+        const auto expanded = expand_pdf_documents(
+            request, options_.enable_vision,
+            [&](const ContentPart& part) {
+                return acquire_source_bytes(part, prepared.lifetime->deadline, is_cancelled,
+                                            remaining_media_bytes);
+            }, prepared.lifetime->deadline, is_cancelled);
         ninfer::PromptInput input =
-            to_prompt_input(request, semantics, [&](const ContentPart& part) {
+            to_prompt_input(expanded, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
                                      remaining_media_bytes);
             });
@@ -389,6 +406,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                                   : ninfer::OutputConsumerMode::Aggregate,
                                               observation, prepared.lifetime->deadline);
         prepared.sampling   = prepared.generation.resolved_sampling();
+    } catch (const ninfer::product::media_acquire::Error& exception) {
+        throw_media_error(exception);
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) {
@@ -411,8 +430,13 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     try {
         std::size_t remaining_media_bytes =
             std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
+        const auto expanded = expand_pdf_documents(
+            request, options_.enable_vision,
+            [&](const ContentPart& part) {
+                return acquire_source_bytes(part, deadline, is_cancelled, remaining_media_bytes);
+            }, deadline, is_cancelled);
         ninfer::PromptInput input =
-            to_prompt_input(request, semantics, [&](const ContentPart& part) {
+            to_prompt_input(expanded, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, deadline, is_cancelled, remaining_media_bytes);
             });
         check_preparation_control(deadline, is_cancelled);
@@ -424,6 +448,8 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
             static_cast<int>(engine_->count_tokens(std::move(input), control));
         check_preparation_control(deadline, is_cancelled);
         return prompt_tokens;
+    } catch (const ninfer::product::media_acquire::Error& exception) {
+        throw_media_error(exception);
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) {

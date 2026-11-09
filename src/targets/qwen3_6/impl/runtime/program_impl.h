@@ -962,6 +962,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     token_counts    = plan.persistent.token_counts.bind(backing);
     sampling_config = plan.persistent.sampling_config.bind(backing);
+    token_masks     = plan.persistent.token_masks.bind(backing);
     active_continuations.fill(continuation_capacity);
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) { lane_epochs[lane] = 1; }
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
@@ -1015,6 +1016,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
+    CUDA_CHECK(cudaMemsetAsync(token_masks.data, 0, token_masks.bytes(), device.stream));
     device.synchronize();
     if (use_cuda_graph) {
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
@@ -1026,7 +1028,61 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     workspace_logical_peak_bytes = 0;
 }
 
+void ProgramImplCore::initialize_pipeline(const LoadedModelData& tail_model,
+    const SequencePlanImpl& owner_plan, const SequencePlanImpl& tail_plan, DeviceContext& tail_device) {
+    if (pipeline || context_cache.enabled || use_cuda_graph || vision_enabled ||
+        speculative_backend != SpeculativeBackend::None ||
+        owner_plan.max_concurrency != continuation_capacity) {
+        throw std::invalid_argument("pipeline Program requires root-only eager execution");
+    }
+    pipeline = std::make_unique<PipelineExecution>(tail_model, owner_plan, tail_plan, device, tail_device);
+}
+
+void ProgramImplCore::initialize_tensor(const LoadedModelData& tail_model,
+    const SequencePlanImpl& owner_plan, const SequencePlanImpl& tail_plan, DeviceContext& tail_device) {
+    if (pipeline || context_cache.enabled || use_cuda_graph || vision_enabled ||
+        speculative_backend != SpeculativeBackend::None ||
+        owner_plan.max_concurrency != continuation_capacity) {
+        throw std::invalid_argument("TP2 Program requires root-only eager execution");
+    }
+    pipeline = std::make_unique<PipelineExecution>(TensorPlacementTag{}, model, tail_model,
+                                                   owner_plan, tail_plan, device, tail_device);
+}
+
+PipelineSequenceBinding& ProgramImplCore::pipeline_binding(const SequenceState& sequence) const {
+    if (!pipeline) throw std::logic_error("pipeline binding requested on Single Program");
+    const auto index = static_cast<std::size_t>(&sequence - continuation_states.data());
+    auto& binding = pipeline->sequences.at(index);
+    if (binding.generation != continuation_slots.at(index).generation ||
+        !binding.state || !binding.address || !pipeline->tail->states->valid(*binding.state) ||
+        !pipeline->tail->addresses->valid(*binding.address)) {
+        throw std::logic_error("pipeline continuation physical binding is stale");
+    }
+    return binding;
+}
+
+void ProgramImplCore::release_pipeline_sequence(SequenceState& sequence, bool strict) noexcept {
+    if (!pipeline) return;
+    try {
+        const auto index = static_cast<std::size_t>(&sequence - continuation_states.data());
+        auto& binding = pipeline->sequences.at(index);
+        if (!binding.state && !binding.address) return;
+        (void)pipeline_binding(sequence);
+        pipeline->drain(device);
+        if (strict) {
+            if (!pipeline->tail->addresses->release_after_deactivate(*binding.address) ||
+                !pipeline->tail->states->release(*binding.state)) std::terminate();
+            binding = {};
+        } else {
+            pipeline->tail->release(binding);
+        }
+    } catch (...) {
+        if (strict) std::terminate();
+    }
+}
+
 ProgramImplCore::~ProgramImplCore() noexcept {
+    if (pipeline) pipeline->drain(device);
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
@@ -1060,7 +1116,14 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
 
     std::optional<StateImageHandle> state;
     std::optional<KVAddressSpaceHandle> address;
+    PipelineActivePreparation remote_score;
     const auto cleanup = [&] {
+        if (pipeline) {
+            pipeline->drain(device);
+            if (remote_score.address && pipeline->tail->addresses->active(*remote_score.address))
+                pipeline->tail->addresses->deactivate(*remote_score.address);
+            pipeline->tail->rollback(remote_score);
+        }
         bool released = true;
         if (address) {
             if (text_kv_addresses->active(*address)) { text_kv_addresses->deactivate(*address); }
@@ -1089,6 +1152,13 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
             throw std::logic_error("causal score did not bind the unique Main KV row");
         }
         text_kv_addresses->ensure_mapped_to_tokens(*address, predictor_count, device.stream);
+        if (pipeline) {
+            if (!pipeline->tail->prepare(remote_score, entitlement, 0)) throw std::bad_alloc();
+            ScopedDevice bind(pipeline->tail->device.device);
+            pipeline->tail->addresses->commit_activation(std::move(*remote_score.activation), pipeline->tail->device.stream);
+            remote_score.activation.reset();
+            pipeline->tail->addresses->ensure_mapped_to_tokens(*remote_score.address, predictor_count, pipeline->tail->device.stream);
+        }
 
         const std::int32_t state_slot = state_store->physical_slot(*state);
         const auto flush              = [&] {
@@ -1137,9 +1207,11 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
                 0,
                 nullptr};
             mark_workspace_usage(workspace_plan.text_prefill);
-            const schedule::PrefillChunkResult result = schedule::prefill_text_chunk(
-                schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,
-                false);
+            const schedule::PrefillChunkResult result = pipeline
+                ? pipeline->prefill(schedule_state, *remote_score.state, *remote_score.address,
+                    text_kv_addresses->bound_row(*address), prompt.token_ids, nominal, false)
+                : schedule::prefill_text_chunk(schedule_state,
+                    std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt, false);
             if (result.finalized || result.processed_tokens == 0 ||
                 result.processed_tokens > nominal) {
                 throw std::logic_error("causal score Prefill made invalid progress");
@@ -1147,6 +1219,7 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
             const std::uint32_t chunk_begin = cursor;
             cursor += result.processed_tokens;
             text_kv_addresses->commit_frontier(*address, cursor);
+            if (pipeline) pipeline->tail->addresses->commit_frontier(*remote_score.address, cursor);
 
             std::uint32_t selected = std::max(chunk_begin, scored_predictor_begin);
             while (selected < cursor) {
@@ -1175,8 +1248,10 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
         cleanup();
         return output;
     } catch (...) {
+        if (pipeline) pipeline->failed = true;
         try {
-            device.synchronize();
+            if (pipeline) pipeline->drain(device);
+            else device.synchronize();
         } catch (...) {}
         work.reset();
         try {
@@ -4556,6 +4631,10 @@ void ProgramImplCore::release_materialization_staging(
         abort_pressure_work(work);
     }
 
+    if (pipeline) {
+        pipeline->drain(device);
+        pipeline->tail->rollback(transaction.pipeline_preparation);
+    }
     abort_materialization_transfers(transaction);
     transaction.backend_retained_tail_backup.reset();
     transaction.text_retained_tail_backup.reset();
@@ -5029,6 +5108,15 @@ bool ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
         stop_context_transfer_timer(runtime::ContextResourceClass::State);
         transaction.transfer_timer_mask |=
             1U << context_resource_index(runtime::ContextResourceClass::State);
+    }
+    if (pipeline) {
+        if (details.reuse != ReusePath::Root || transaction.has_source ||
+            transaction.has_shared_source || details.backend_kv_page_entitlement != 0 ||
+            details.summary.publish_continuation) {
+            throw std::logic_error("pipeline materialization requires unpublished root state");
+        }
+        if (!pipeline->tail->prepare(transaction.pipeline_preparation,
+                details.text_kv_page_entitlement, static_cast<std::int32_t>(lane))) return false;
     }
     transaction.prepared = true;
     requests[lane].prefill->elapsed_seconds +=
@@ -6654,6 +6742,8 @@ void ProgramImplCore::retire_continuation_slot(std::uint32_t index) noexcept {
             active_continuations[lane] = continuation_capacity;
         }
     }
+    if (pipeline && (pipeline->sequences[index].state || pipeline->sequences[index].address))
+        std::terminate();
     ContinuationSlot& slot = continuation_slots[index];
     slot.role              = ContinuationSlotRole::Free;
     if (++slot.generation == 0) { ++slot.generation; }
@@ -9053,8 +9143,11 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 if (is_masked_draft_backend(speculative_backend)) {
                     mark_workspace_usage(workspace_plan.dflash_context);
                 }
-                const schedule::PrefillChunkResult result = schedule::prefill_text_chunk(
-                    schedule_state, sequence.ledger, count, std::nullopt, false);
+                const schedule::PrefillChunkResult result = pipeline
+                    ? pipeline->prefill(schedule_state, *pipeline_binding(sequence).state,
+                        *pipeline_binding(sequence).address,
+                        text_kv_addresses->bound_row(sequence.kv->text), sequence.ledger, count, false)
+                    : schedule::prefill_text_chunk(schedule_state, sequence.ledger, count, std::nullopt, false);
                 if (result.finalized || result.processed_tokens == 0 ||
                     result.processed_tokens > count) {
                     throw std::logic_error("forced-token prefill made invalid progress");
@@ -9098,7 +9191,8 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
     } catch (...) {
         timing.begin_wait();
         try {
-            device.synchronize();
+            if (pipeline) pipeline->drain(device);
+            else device.synchronize();
         } catch (...) {}
         timing.end_wait();
         work.reset();
@@ -9156,10 +9250,16 @@ CommitResult ProgramImplCore::commit(PendingBatch&& pending,
                 throw std::logic_error(
                     "active cancellation overlaps the global context transaction");
             }
+            // A grammar-constrained lane may commit a partial non-terminal prefix: the mask
+            // covers only the first speculative position, so the Frontend can reject a later
+            // draft mid-round. resolve_pending_raw re-validates the same relaxation.
+            const bool grammar_constrained =
+                !decision.cancelled && requests[lane].sampling_host.token_mask != nullptr;
             if ((decision.cancelled && (decision.accepted_tokens != 0 || !decision.terminal)) ||
                 (!decision.cancelled &&
                  (decision.accepted_tokens == 0 || decision.accepted_tokens > candidate.produced ||
-                  (!decision.terminal && decision.accepted_tokens != candidate.produced))) ||
+                  (!decision.terminal && decision.accepted_tokens != candidate.produced &&
+                   !grammar_constrained))) ||
                 (decision.prefix_execution_split_after &&
                  (decision.cancelled || *decision.prefix_execution_split_after == 0 ||
                   *decision.prefix_execution_split_after > decision.accepted_tokens))) {
@@ -9561,7 +9661,14 @@ bool ProgramImplCore::persistent_backfill_safe(
 
 qwen3_6::PhysicalUsageSnapshot ProgramImplCore::physical_usage() const noexcept {
     const detail::PhysicalResources usage = physical_occupancy();
+    std::array<qwen3_6::PhysicalRankUsage, 2> ranks{};
+    ranks[0] = {device.device, usage.device.state_slots, usage.device.main_kv_pages};
+    if (pipeline) ranks[1] = {pipeline->tail->device.device,
+        pipeline->tail->states->device_occupied(),
+        pipeline->tail->pages->physical_pool().allocated_pages() + pipeline->tail->pages->physical_pool().reserved_pages()};
     return qwen3_6::PhysicalUsageSnapshot{
+        .ranks = ranks,
+        .rank_count = pipeline ? 2U : 1U,
         .resource_revision       = resource_revision_,
         .device_state_slots      = usage.device.state_slots,
         .host_state_slots        = usage.host.state_slots,
@@ -9624,6 +9731,23 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 transaction.root_backend_address.reset();
             }
             sequence.kv.emplace(bundle);
+            if (pipeline) {
+                auto& pending = transaction.pipeline_preparation;
+                if (!pending.state || !pending.address || !pending.activation)
+                    throw std::logic_error("pipeline root reservations are incomplete");
+                const auto index = static_cast<std::size_t>(&sequence - continuation_states.data());
+                auto& binding = pipeline->sequences.at(index);
+                // Until activation succeeds the transaction remains the sole cleanup owner.
+                ScopedDevice bind(pipeline->tail->device.device);
+                pipeline->tail->addresses->commit_activation(std::move(*pending.activation),
+                                                             pipeline->tail->device.stream);
+                pending.activation.reset();
+                binding.generation = continuation_slots[index].generation;
+                binding.state = pending.state;
+                binding.address = pending.address;
+                pending.state.reset();
+                pending.address.reset();
+            }
         } else if (preserving_source) {
             const bool private_source_ready = transaction.has_source &&
                                               transaction.source_index < continuation_capacity &&
@@ -10028,6 +10152,10 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                                                                 : 0U;
         ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
         install_sampling(sequence, request, request_plan.sampling);
+        if (!request_plan.token_mask.empty()) {
+            request.initial_token_mask = request_plan.token_mask;
+            set_token_mask_lane(lane, request.initial_token_mask);
+        }
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
@@ -10062,7 +10190,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         request.lifecycle = Lifecycle::Prefilling;
     } catch (...) {
         try {
-            device.synchronize();
+            if (pipeline) pipeline->drain(device);
+            else device.synchronize();
         } catch (...) {}
         clear_lane_best_effort(sequence, request);
         throw;
@@ -10171,9 +10300,14 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             throw std::logic_error("speculative pending row is not at its recorded base");
         }
         const std::uint32_t committed = cancelled[row] ? 0U : accepted_tokens[row];
+        // A grammar-constrained lane may license a partial non-terminal prefix: the mask covers
+        // only the first speculative position, so the Frontend can reject a later draft mid-round.
+        const bool grammar_constrained =
+            !cancelled[row] && requests[lane].sampling_host.token_mask != nullptr;
         if ((cancelled[row] && accepted_tokens[row] != 0) ||
             (!cancelled[row] && (committed == 0 || committed > pending.produced ||
-                                 (!terminal[row] && committed != pending.produced)))) {
+                                 (!terminal[row] && committed != pending.produced &&
+                                  !grammar_constrained)))) {
             throw std::logic_error("speculative pending row has an invalid committed prefix");
         }
         const StateImageSelectors selectors = state_selectors(sequence);
@@ -10181,11 +10315,10 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
             ops::GdnReplayFoldRow{.source_state_slot      = selectors.source,
                                   .destination_state_slot = selectors.destination,
                                   .commit_columns         = static_cast<std::int32_t>(committed)};
-        const bool partial_terminal =
-            !cancelled[row] && terminal[row] && committed < pending.produced;
+        const bool partial_commit = !cancelled[row] && committed < pending.produced;
         hidden_selectors[row] =
-            static_cast<std::int32_t>(partial_terminal ? committed - 1U : pending.produced - 1U);
-        needs_hidden_correction = needs_hidden_correction || partial_terminal;
+            static_cast<std::int32_t>(partial_commit ? committed - 1U : pending.produced - 1U);
+        needs_hidden_correction = needs_hidden_correction || partial_commit;
     }
 
     const auto tail_started = Clock::now();
@@ -10268,7 +10401,8 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
         work.reset();
     } catch (...) {
         try {
-            device.synchronize();
+            if (pipeline) pipeline->drain(device);
+            else device.synchronize();
         } catch (...) {}
         work.reset();
         clear_execution_failure_lanes(lanes);
@@ -10307,7 +10441,7 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
 
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 sequence.mtp_kv_valid = sequence.execution_frontier;
-                if (terminal[row]) {
+                if (terminal[row] || committed < pending.produced) {
                     sequence.mtp_draft_count = 0;
                 } else {
                     const std::int32_t next  = mtp_host_egress->next_extents[row];
@@ -10340,6 +10474,11 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
 }
 
 bool ProgramImplCore::can_clear_lane_strict(const SequenceState& sequence) const {
+    if (pipeline) {
+        const auto& binding = pipeline_binding(sequence);
+        if (!pipeline->tail->states->can_release(*binding.state) ||
+            !pipeline->tail->addresses->can_release_after_deactivate(*binding.address)) return false;
+    }
     const auto* begin = continuation_states.data();
     const auto* end   = begin + continuation_capacity;
     if (&sequence < begin || &sequence >= end || !state_store || !text_kv_addresses ||
@@ -10463,6 +10602,7 @@ bool ProgramImplCore::clear_lane_strict(SequenceState& sequence, RequestControl&
     request.prefill.reset();
     request.lifecycle            = Lifecycle::Empty;
     request.pending              = {};
+    request.initial_token_mask   = {};
     request.active_resources     = {};
     request.optional_resources   = {};
     request.publish_continuation = true;
@@ -10487,6 +10627,7 @@ void ProgramImplCore::clear_lane_best_effort(SequenceState& sequence,
     request.prefill.reset();
     request.lifecycle            = Lifecycle::Empty;
     request.pending              = {};
+    request.initial_token_mask   = {};
     request.active_resources     = {};
     request.optional_resources   = {};
     request.publish_continuation = true;
@@ -10822,6 +10963,10 @@ void ProgramImplCore::resize_sequence_kv_entitlement(SequenceState& sequence,
         (sequence.kv->backend.has_value() != (backend_pages != 0))) {
         throw std::invalid_argument("KV resize entitlement does not match the sequence bundle");
     }
+    if (pipeline) {
+        auto& binding = pipeline_binding(sequence);
+        pipeline->tail->addresses->resize_entitlement(*binding.address, text_pages);
+    }
     text_kv_addresses->resize_entitlement(sequence.kv->text, text_pages);
     if (sequence.kv->backend) {
         backend_kv_addresses->resize_entitlement(*sequence.kv->backend, backend_pages);
@@ -10829,6 +10974,15 @@ void ProgramImplCore::resize_sequence_kv_entitlement(SequenceState& sequence,
 }
 
 void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
+    if (pipeline) {
+        auto& binding = pipeline_binding(sequence);
+        if (!pipeline->tail->addresses->active(*binding.address)) {
+            ScopedDevice bind(pipeline->tail->device.device);
+            pipeline->tail->addresses->activate(*binding.address,
+                pipeline->tail->addresses->mapped_pages(*binding.address),
+                static_cast<std::int32_t>(sequence.lane), pipeline->tail->device.stream);
+        }
+    }
     if (!sequence.kv) { throw std::logic_error("KV allocation bundle is unavailable"); }
     const std::int32_t row = static_cast<std::int32_t>(sequence.lane);
     const bool text_active = text_kv_addresses->active(sequence.kv->text);
@@ -10867,6 +11021,13 @@ void ProgramImplCore::bind_sequence_kv(SequenceState& sequence) {
 }
 
 void ProgramImplCore::unbind_sequence_kv(SequenceState& sequence) noexcept {
+    if (pipeline) {
+        try {
+            auto& binding = pipeline_binding(sequence);
+            if (pipeline->tail->addresses->active(*binding.address))
+                pipeline->tail->addresses->deactivate(*binding.address);
+        } catch (...) {}
+    }
     if (!sequence.kv) { return; }
     try {
         if (sequence.kv->backend && backend_kv_addresses->active(*sequence.kv->backend)) {
@@ -10888,6 +11049,12 @@ void ProgramImplCore::ensure_sequence_kv_mapped(SequenceState& sequence, std::ui
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
+    if (pipeline) {
+        auto& binding = pipeline_binding(sequence);
+        ScopedDevice bind(pipeline->tail->device.device);
+        pipeline->tail->addresses->ensure_mapped_to_tokens(*binding.address, main_tokens,
+                                                          pipeline->tail->device.stream);
+    }
     text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens, device.stream);
     if (backend_tokens != 0) {
         backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, backend_tokens,
@@ -10901,6 +11068,7 @@ void ProgramImplCore::commit_sequence_kv(SequenceState& sequence, std::uint32_t 
         (backend_tokens != 0 && !sequence.kv->backend)) {
         throw std::logic_error("KV commit request is outside the sequence bundle");
     }
+    if (pipeline) pipeline->tail->addresses->commit_frontier(*pipeline_binding(sequence).address, main_tokens);
     text_kv_addresses->commit_frontier(sequence.kv->text, main_tokens);
     if (sequence.kv->backend) {
         backend_kv_addresses->commit_frontier(*sequence.kv->backend, backend_tokens);
@@ -10915,6 +11083,7 @@ void ProgramImplCore::trim_sequence_kv(SequenceState& sequence, std::uint32_t ma
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV trim requested without an allocation");
     }
+    if (pipeline) pipeline->tail->addresses->destructive_truncate(*pipeline_binding(sequence).address, main_tokens);
     text_kv_addresses->destructive_truncate(sequence.kv->text, main_tokens);
     if (sequence.kv->backend) {
         backend_kv_addresses->destructive_truncate(*sequence.kv->backend, backend_tokens);
@@ -10924,6 +11093,7 @@ void ProgramImplCore::trim_sequence_kv(SequenceState& sequence, std::uint32_t ma
 void ProgramImplCore::release_sequence_growth_entitlement(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     try {
+        if (pipeline) pipeline->tail->addresses->release_growth_entitlement(*pipeline_binding(sequence).address);
         text_kv_addresses->release_growth_entitlement(sequence.kv->text);
         if (sequence.kv->backend) {
             backend_kv_addresses->release_growth_entitlement(*sequence.kv->backend);
@@ -10932,6 +11102,7 @@ void ProgramImplCore::release_sequence_growth_entitlement(SequenceState& sequenc
 }
 
 void ProgramImplCore::release_active_sequence_kv_strict(SequenceState& sequence) noexcept {
+    release_pipeline_sequence(sequence, true);
     if (!sequence.kv || !text_kv_addresses ||
         !text_kv_addresses->can_release_after_deactivate(sequence.kv->text) ||
         (sequence.kv->backend &&
@@ -10949,6 +11120,7 @@ void ProgramImplCore::release_active_sequence_kv_strict(SequenceState& sequence)
 }
 
 void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexcept {
+    release_pipeline_sequence(sequence, true);
     if (!sequence.kv || !text_kv_addresses || !text_kv_addresses->can_release(sequence.kv->text)) {
         std::terminate();
     }
@@ -10965,6 +11137,7 @@ void ProgramImplCore::release_sequence_kv_strict(SequenceState& sequence) noexce
 }
 
 void ProgramImplCore::release_sequence_kv(SequenceState& sequence) noexcept {
+    release_pipeline_sequence(sequence, false);
     if (!sequence.kv) { return; }
     unbind_sequence_kv(sequence);
     if (sequence.kv->backend && backend_kv_addresses) {
@@ -11401,6 +11574,25 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
                                device.stream));
 }
 
+void ProgramImplCore::set_token_mask_lane(std::uint32_t lane,
+                                          std::span<const std::uint32_t> mask) {
+    if (lane >= max_concurrency) { throw std::out_of_range("token-mask lane is out of range"); }
+    const std::size_t expected = static_cast<std::size_t>((TextConfig::token_domain + 31) / 32);
+    if (mask.size() != expected) { throw std::invalid_argument("token mask has an invalid size"); }
+    Tensor device_mask = token_masks.slice(1, static_cast<std::int32_t>(lane), 1)
+                             .view({static_cast<std::int32_t>(expected)});
+    CUDA_CHECK(cudaMemcpyAsync(device_mask.data, mask.data(), device_mask.bytes(),
+                               cudaMemcpyHostToDevice, device.stream));
+    RequestControl& request          = requests[lane];
+    request.sampling_host.token_mask = static_cast<const std::uint32_t*>(device_mask.data);
+    // Decode rounds re-publish sampling_host through the host ingress every round, but prefill
+    // sampling and graph-captured paths read the device-resident lane config; keep both current.
+    Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
+    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
+                               sizeof(request.sampling_host), cudaMemcpyHostToDevice,
+                               device.stream));
+}
+
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
     if (source.dtype != DType::BF16 || source.ne[0] != TextConfig::hidden || source.ne[1] != 1) {
         throw std::logic_error("target tail hidden has an invalid shape");
@@ -11642,9 +11834,16 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                                                 *staged.vision, remaining,
                                                                 split_frontier, final_candidate);
                 } else {
-                    result = schedule::prefill_text_chunk(
-                        schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
-                        remaining, split_frontier, final_candidate);
+                    if (pipeline) {
+                        result = pipeline->prefill(schedule_state, *pipeline_binding(sequence).state,
+                            *pipeline_binding(sequence).address,
+                            text_kv_addresses->bound_row(sequence.kv->text),
+                            staged.prompt.token_ids, remaining, final_candidate, split_frontier);
+                    } else {
+                        result = schedule::prefill_text_chunk(
+                            schedule_state, std::span<const TokenId>(staged.prompt.token_ids),
+                            remaining, split_frontier, final_candidate);
+                    }
                 }
                 timing.include(result.timing);
                 timing.resume_post();
@@ -11793,7 +11992,8 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
     } catch (...) {
         timing.begin_wait();
         try {
-            device.synchronize();
+            if (pipeline) pipeline->drain(device);
+            else device.synchronize();
         } catch (...) {}
         timing.end_wait();
         const std::uint32_t lane = sequence.lane;
@@ -11883,8 +12083,17 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                                       state_images->continuation_hidden_store()};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
-        schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                        envelope, executable);
+        if (pipeline) {
+            std::array<std::uint32_t, kMaximumConcurrency> indices{};
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                (void)pipeline_binding(active_sequence(lanes[row]));
+                indices[row] = active_continuations[lanes[row]];
+            }
+            pipeline->decode(schedule_state, std::span<const std::uint32_t>(indices.data(), lanes.size()), envelope);
+        } else {
+            schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
+                                            envelope, executable);
+        }
         submit_range.reset();
         timing.begin_wait();
         {
@@ -11927,7 +12136,8 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         try {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
+            if (pipeline) pipeline->drain(device);
+            else device.synchronize();
         } catch (...) {}
         timing.end_wait();
         clear_execution_failure_lanes(lanes);
@@ -12111,7 +12321,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         try {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
+            if (pipeline) pipeline->drain(device);
+            else device.synchronize();
         } catch (...) {}
         timing.end_wait();
         clear_execution_failure_lanes(lanes);
@@ -12305,7 +12516,8 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         try {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
-            device.synchronize();
+            if (pipeline) pipeline->drain(device);
+            else device.synchronize();
         } catch (...) {}
         timing.end_wait();
         clear_execution_failure_lanes(lanes);
@@ -12445,10 +12657,43 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
         out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();
         out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes();
     }
+    out.physical_devices[0] = {
+        .device = device.device, .weights = out.weights, .sequence = out.sequence,
+        .workspace = out.workspace, .state_capacity_slots = state_store->device_capacity(),
+        .state_occupied_slots = state_store->device_occupied(),
+        .kv_capacity_pages = decoder->text_kv.page_pool().capacity_pages(),
+        .kv_occupied_pages = text_kv_pages->physical_pool().allocated_pages() + text_kv_pages->physical_pool().reserved_pages()};
+    if (pipeline) {
+        const auto arena = [](const DeviceArena& value) {
+            return ArenaMemorySummary{value.capacity(), value.used(), value.peak_used()};
+        };
+        auto& tail = *pipeline->tail;
+        out.physical_device_count = 2;
+        out.physical_devices[0].communication = arena(pipeline->owner_buffers.storage);
+        out.physical_devices[1] = {
+            .device = tail.device.device, .weights = arena(*tail.model.weights_arena),
+            .sequence = arena(tail.persistent),
+            .workspace = {tail.workspace_storage.capacity(), tail.work.used(), tail.work.peak_used()},
+            .communication = arena(tail.buffers.storage),
+            .state_capacity_slots = tail.states->device_capacity(),
+            .state_occupied_slots = tail.states->device_occupied(),
+            .kv_capacity_pages = tail.decoder->text_kv.page_pool().capacity_pages(),
+            .kv_occupied_pages = tail.pages->physical_pool().allocated_pages() + tail.pages->physical_pool().reserved_pages()};
+        out.pipeline_host_transfer_capacity_bytes =
+            (pipeline->outbound->transport() == TransferTransport::pinned_host ? pipeline->owner_buffers.residual.bytes() : 0) +
+            (pipeline->inbound && pipeline->inbound->transport() == TransferTransport::pinned_host ? tail.buffers.residual.bytes() : 0);
+    }
     return out;
 }
 
 void ProgramImplCore::reset_memory_peaks() noexcept {
+    if (pipeline) {
+        pipeline->owner_buffers.storage.reset_peak();
+        pipeline->tail->model.weights_arena->reset_peak();
+        pipeline->tail->persistent.reset_peak();
+        pipeline->tail->work.reset_peak();
+        pipeline->tail->buffers.storage.reset_peak();
+    }
     model.weights_arena->reset_peak();
     persistent.reset_peak();
     work.reset_peak();

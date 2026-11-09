@@ -725,12 +725,18 @@ void dispatch_split_parent(const Tensor& x, const Weight& qk_weight, const Weigh
     if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
         throw std::invalid_argument("gdn_input_proj: Q4/Q5 parents admit only A16 or A8");
     }
-    constexpr std::int32_t kHidden     = 5120;
-    constexpr std::int32_t kQkRows     = 4096;
-    constexpr std::int32_t kValueRows  = 6144;
-    constexpr std::int32_t kZRows      = 6144;
-    constexpr std::int32_t kQkvRows    = kQkRows + kValueRows;
-    constexpr std::int32_t kParentRows = kValueRows + kZRows;
+    constexpr std::int32_t kHidden = 5120;
+    const bool local = qk_weight.n == 2048 && value_z_weight.n == 6144;
+    if (local && policy != LinearPolicy::AllowA8 &&
+        !(policy == LinearPolicy::A16Only && x.ne[1] <= 15)) {
+        throw std::invalid_argument(
+            "gdn_input_proj: local Q4/Q5 parents require AllowA8, or A16Only for T<=15");
+    }
+    const std::int32_t kQkRows = local ? 2048 : 4096;
+    const std::int32_t kValueRows = local ? 3072 : 6144;
+    const std::int32_t kZRows = kValueRows;
+    const std::int32_t kQkvRows = kQkRows + kValueRows;
+    const std::int32_t kParentRows = kValueRows + kZRows;
     const std::int32_t cols            = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
     require_matrix(x, kHidden, cols, "x");
@@ -931,8 +937,8 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
             throw std::logic_error("ReplaySSM record planner admitted NVFP4 decode");
         }
         if (maximum_plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) { return 0; }
-        return detail::nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4,
-                                                                std::max(min_width, 4), max_width);
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, std::max(min_width, 4),
+                                                                max_width);
     }
     return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, batch_size * min_width,
                                                             batch_size * max_width);

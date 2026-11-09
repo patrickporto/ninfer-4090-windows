@@ -80,6 +80,11 @@ bool supported_shape(const Q4Q5GdnInputProblem& problem) noexcept {
            problem.qkv_rows == 10240 && problem.z_rows == 6144 && problem.padded_k == 5120;
 }
 
+bool supported_local_shape(const Q4Q5GdnInputProblem& problem) noexcept {
+    return problem.input_rows == 5120 && problem.qk_rows == 2048 && problem.value_z_rows == 6144 &&
+           problem.qkv_rows == 5120 && problem.z_rows == 3072 && problem.padded_k == 5120;
+}
+
 } // namespace
 
 const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexcept {
@@ -105,7 +110,7 @@ const char* q4_q5_gdn_input_conv_schedule_name(Q4Q5GdnInputConvScheduleId schedu
 }
 
 bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1;
+    return (supported_shape(problem) || supported_local_shape(problem)) && problem.cols >= 1;
 }
 
 Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem,
@@ -113,6 +118,12 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
     if (!q4_q5_gdn_input_admits(problem)) {
         throw std::invalid_argument(
             "Q4/Q5 GDN input: exact problem or column count is not admitted");
+    }
+    // Local geometry: A8 at every extent (prefill) or the A16 IndependentDirectFixed decode route.
+    if (supported_local_shape(problem) && policy != LinearPolicy::AllowA8 &&
+        !(policy == LinearPolicy::A16Only && problem.cols <= 15)) {
+        throw std::invalid_argument(
+            "Q4/Q5 GDN input: local geometry requires AllowA8, or A16Only for T<=15");
     }
 
     return visit_routes(policy, [&](const auto& routes) -> Q4Q5GdnInputPlan {
@@ -140,7 +151,7 @@ std::size_t q4_q5_gdn_input_capacity_workspace_bytes(std::int32_t min_tokens,
 
 Q4Q5GdnInputConvPlan q4_q5_gdn_input_conv_resolve_plan(const Q4Q5GdnInputProblem& problem,
                                                        std::int32_t batch_size) {
-    if (!q4_q5_gdn_input_admits(problem) || batch_size <= 0 || batch_size > 8) {
+    if (!supported_shape(problem) || problem.cols <= 0 || batch_size <= 0 || batch_size > 8) {
         throw std::invalid_argument(
             "Q4/Q5 GDN input conv: exact problem or column count is not admitted");
     }

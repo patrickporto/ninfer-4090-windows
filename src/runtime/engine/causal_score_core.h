@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/cuda_error_scope.h"
 #include "ninfer/types.h"
 #include "runtime/engine/kv_capacity.h"
 
@@ -25,11 +26,12 @@ public:
     using Package        = typename Instance::Package;
     using PreparedPrompt = typename Package::PreparedPrompt;
 
-    CausalScoreCore(Instance& instance, DeviceContext& device)
+    CausalScoreCore(Instance& instance, DeviceContext& device, bool pipeline = false)
         : instance_(instance), device_(device) {
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
-        worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
+        worker_                   = std::thread([this, startup = std::move(startup), pipeline]() mutable {
+            ScopedCudaErrors errors(pipeline);
             try {
                 device_.bind_to_current_thread();
                 startup.set_value();
@@ -68,7 +70,7 @@ public:
         std::future<std::vector<float>> result = job->promise.get_future();
         {
             std::lock_guard queue_lock(queue_mutex_);
-            if (stopping_) { throw std::runtime_error("causal scoring engine is stopping"); }
+            if (stopping_ || failed_) { throw std::runtime_error("causal scoring engine is unavailable"); }
             if (job_ != nullptr) {
                 throw std::logic_error("causal scoring core already has an in-flight job");
             }
@@ -92,21 +94,35 @@ public:
         out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
         out.kv_capacity_headroom_bytes         = resolution.automatic_headroom_bytes;
         out.planned_slack_bytes                = resolution.planned_slack_bytes;
+        out.physical_devices[0].runtime_reservation_bytes = resolution.runtime_reservation_bytes;
+        out.physical_devices[0].available_after_weights_bytes = resolution.available_after_weights_bytes;
+        out.physical_devices[0].available_after_startup_bytes = resolution.available_after_startup_bytes;
+        if constexpr (requires { instance_.pipeline_capacity; }) {
+            if (out.physical_device_count == 2) {
+                for (unsigned rank = 0; rank < 2; ++rank) {
+                    const auto& capacity = instance_.pipeline_capacity[rank];
+                    auto& physical = out.physical_devices[rank];
+                    physical.runtime_reservation_bytes = capacity.runtime_reservation_bytes;
+                    physical.available_after_weights_bytes = capacity.available_after_weights_bytes;
+                    physical.available_after_startup_bytes = capacity.available_after_startup_bytes;
+                }
+            }
+        }
         return out;
     }
 
-    // The scoring core has no failure latch of its own - a failed score throws to its
-    // caller rather than latching - so it is healthy until it is stopping.
+    // Pipeline stateful execution failures quarantine the physical unit. Input validation
+    // failures and the existing Single scoring path remain independently retryable.
     [[nodiscard]] bool healthy() const noexcept {
         std::lock_guard lock(queue_mutex_);
-        return !stopping_;
+        return !stopping_ && !failed_;
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const noexcept { return {}; }
 
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);
-        return !stopping_;
+        return !stopping_ && !failed_;
     }
 
     void reset_memory_peaks() noexcept {
@@ -144,6 +160,13 @@ private:
                 }
                 job->promise.set_value(std::move(result));
             } catch (...) {
+                {
+                    std::scoped_lock execution_lock(execution_mutex_);
+                    if (instance_.program->execution_failed()) {
+                        std::lock_guard queue_lock(queue_mutex_);
+                        failed_ = true;
+                    }
+                }
                 try {
                     job->promise.set_exception(std::current_exception());
                 } catch (...) {}
@@ -159,6 +182,7 @@ private:
     std::condition_variable queue_cv_;
     std::unique_ptr<Job> job_;
     bool stopping_ = false;
+    bool failed_ = false;
     std::thread worker_;
 };
 

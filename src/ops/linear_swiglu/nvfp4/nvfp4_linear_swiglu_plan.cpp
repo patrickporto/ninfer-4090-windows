@@ -16,6 +16,7 @@ namespace {
 enum class Nvfp4LinearSwiGluRoute {
     DecodeFusedA16,
     SmallTFusedA16,
+    ChunkedFusedA16,
     FusedW4A4,
     LinearW4A4Post,
     TmaFusedW4A4,
@@ -32,7 +33,8 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (policy == LinearPolicy::A16Only) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
         if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-        throw std::invalid_argument("nvfp4 linear_swiglu A16 is registered only through T=16");
+        // The fused A16 kernel is registered through T=16; wider batches run it in chunks.
+        return Nvfp4LinearSwiGluRoute::ChunkedFusedA16;
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
@@ -120,6 +122,28 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
         nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
         return;
+    case Nvfp4LinearSwiGluRoute::ChunkedFusedA16: {
+        // Column-independent GEMM + SwiGLU, so chunking at the fused kernel's T=16
+        // registration boundary is exact. Chunk strides follow the packed column-major
+        // layout and stay 16-byte aligned (5120*2 and 17408*2 bytes per token).
+        constexpr std::int32_t kChunk = 16;
+        for (std::int32_t token_begin = 0; token_begin < x.ne[1]; token_begin += kChunk) {
+            const std::int32_t active = std::min(kChunk, x.ne[1] - token_begin);
+            auto* input              = static_cast<std::uint8_t*>(x.data) +
+                          static_cast<std::int64_t>(token_begin) * weight.k * sizeof(std::uint16_t);
+            auto* output = static_cast<std::uint8_t*>(out.data) +
+                           static_cast<std::int64_t>(token_begin) * out.ne[0] *
+                               sizeof(std::uint16_t);
+            Tensor input_chunk(input, DType::BF16, {weight.k, active});
+            Tensor output_chunk(output, DType::BF16, {out.ne[0], active});
+            if (active == 1) {
+                nvfp4_linear_swiglu_decode_launch(input_chunk, weight, output_chunk, stream);
+            } else {
+                nvfp4_linear_swiglu_small_t_launch(input_chunk, weight, output_chunk, stream);
+            }
+        }
+        return;
+    }
     case Nvfp4LinearSwiGluRoute::FusedW4A4:
         nvfp4_linear_swiglu_w4a4_launch(x, weight, out, workspace, stream);
         return;

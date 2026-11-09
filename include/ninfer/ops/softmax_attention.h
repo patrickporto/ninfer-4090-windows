@@ -50,6 +50,17 @@ struct ContextAttentionExecutionEnvelope {
  * kernel's private arithmetic. Newly appended rows cross their specified persistent codec
  * boundary before attention observes them.
  *
+ * RK4V4-E8 instead rotates each contiguous 64-feature K/V group with H64/8. Each group stores
+ * FP16_RNE(max(abs(rotated))/7) and adjacent signed four-bit codes, lower feature in the low
+ * nibble. From FP32 rotated values and the reciprocal of the represented scale, V codes are
+ * RNE-even values clamped to [-7,7]. K chooses the nearest D8 or D8+0.5 point independently per
+ * eight features (ties choose D8 and the lowest correction coordinate), rounds its coordinates
+ * to even integers, and clamps to [-8,7]. The half coset is deliberately collapsed: no coset bit
+ * is stored. Zero-scale groups store zero codes. Decoded coordinates are signed code times
+ * represented scale. The oracle transforms public Q by H64/8 in FP64, evaluates attention
+ * against these decoded cache coordinates, and transforms the complete result by H64/8 in
+ * FP64. Private query quantization and intermediate BF16 output staging are not oracle inputs.
+ *
  * Kernels may select native BF16/FP16/INT8/FP8 operands, internal reductions, staging precision
  * and decomposition. These are qualified implementation profiles, not extra public tensor
  * boundaries. Every cache route is checked directly against the independent mathematical oracle
@@ -106,10 +117,12 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 /**
  * Append K/V for B independent rows and compute causal grouped-query attention.
  *
- * The registered profiles are [D,Hq,Hkv]=[256,24,4] (group 6) and [256,16,2] (group 8), with
- * scale=1/sqrt(256). q/out are contiguous BF16 [D,Hq,W,B], k/v are contiguous BF16
+ * The registered profiles are [D,Hq,Hkv]=[256,24,4] (group 6), [256,16,2] (group 8), and
+ * [256,12,2] (group 6). The last profile accepts only BFloat16 and RK4V4-E8 cache storage.
+ * All profiles use scale=1/sqrt(256). q/out are contiguous BF16 [D,Hq,W,B], k/v are contiguous BF16
  * [D,Hkv,W,B], positions are contiguous device I32 [W,B], kv_table_rows is contiguous device I32
- * [B], and the cache is BF16, INT8-G64, row-scaled FP8-E4M3FN, NVFP4-G16, or K8V4. valid_columns is
+ * [B]. Cache formats include BF16, INT8-G64, row-scaled FP8-E4M3FN, NVFP4-G16, K8V4, and the
+ * registered packed/rotated INT8-family formats including RK4V4-E8. valid_columns is
  * either contiguous device I32 [B] or an empty Tensor meaning every row has W live columns. This
  * dense/masked topology is chosen by the caller and never inferred by copying device metadata to
  * the host. B=1 accepts every positive W in the current prompt/decode domain; B=2..8 accepts
@@ -143,7 +156,7 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 /**
  * Read-only single-sequence causal attention over an already populated cache.
  *
- * q/out are contiguous BF16 [256,24|16,T], positions is contiguous sequential device I32 [T],
+ * q/out are contiguous BF16 [256,24|16|12,T], positions is contiguous sequential device I32 [T],
  * and cache geometry, visible rows, scale, numerical oracle, envelope, alias, and workspace rules
  * are the same as causal_softmax_attention. The Op accepts no new K/V and leaves every cache byte
  * unchanged; out is completely overwritten.

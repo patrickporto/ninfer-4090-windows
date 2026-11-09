@@ -3,6 +3,7 @@
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
 #include "core/arena.h"
+#include "targets/qwen3_6/impl/runtime/pipeline_execution.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -193,6 +194,9 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     qwen3_6::detail::PrefixShortlistDigests prefix_digests;
     std::uint32_t prefix_identity_tag = 0;
     bool allow_prefix_reuse           = false;
+    // Initial grammar bitmask (ceil(token_domain/32) words) installed on the lane at sequence
+    // start; empty when the request has no structured-output constraint.
+    std::vector<std::uint32_t> token_mask;
 };
 
 // Program-owned physical planning state shared by request materialization and active capture.
@@ -253,6 +257,7 @@ struct AdmissionCandidateImpl<NINFER_QWEN36_VARIANT> : ResourceCandidateState {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    std::vector<std::uint32_t> token_mask;
     runtime::LaneId destination{};
     std::uint64_t destination_epoch = 0;
     runtime::PrefillWork root_rebuild_work;
@@ -462,6 +467,7 @@ struct RequestControl {
     Lifecycle lifecycle = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
+    std::vector<std::uint32_t> initial_token_mask;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
     detail::PhysicalResources active_resources;
@@ -520,6 +526,13 @@ public:
     ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
                     DeviceContext& device, const StartupObserver& startup_observer);
     ~ProgramImplCore() noexcept;
+    void initialize_pipeline(const LoadedModelData& tail_model, const SequencePlanImpl& owner_plan,
+                             const SequencePlanImpl& tail_plan, DeviceContext& tail_device);
+    void initialize_tensor(const LoadedModelData& tail_model, const SequencePlanImpl& owner_plan,
+                           const SequencePlanImpl& tail_plan, DeviceContext& tail_device);
+    PipelineSequenceBinding& pipeline_binding(const SequenceState& sequence) const;
+    void release_pipeline_sequence(SequenceState& sequence, bool strict) noexcept;
+
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
@@ -589,6 +602,7 @@ public:
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets,
                                       runtime::ExecutionTiming* failed_timing);
+    void set_token_mask_lane(std::uint32_t lane, std::span<const std::uint32_t> mask);
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle> sequences,
                          std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
@@ -644,6 +658,7 @@ public:
     const std::size_t graph_allowance_bytes;
     const WorkspacePlan workspace_plan;
 
+    std::unique_ptr<PipelineExecution> pipeline;
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
@@ -667,6 +682,7 @@ public:
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;
+    Tensor token_masks;
 
     std::vector<SequenceState> continuation_states;
     std::vector<ContinuationSlot> continuation_slots;
@@ -878,6 +894,7 @@ private:
         bool root_waiting_for_victim = false;
         std::array<StateImageHandle, 2> reserved_states{};
         std::size_t reserved_state_count = 0;
+        PipelineActivePreparation pipeline_preparation;
         std::optional<StateImageHandle> state_fork_destination;
         std::optional<KVAddressSpaceHandle> root_text_address;
         std::optional<KVAddressSpaceHandle> root_backend_address;

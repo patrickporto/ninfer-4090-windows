@@ -1,8 +1,11 @@
 #include "evaluation.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <ostream>
 #include <stdexcept>
 
 namespace ninfer::perplexity {
@@ -39,6 +42,44 @@ std::vector<WindowPlan> plan_windows(std::size_t tokens, std::uint32_t context,
         previous_end = end;
     }
     return windows;
+}
+
+void write_token_nll(std::ostream& output, std::string_view stream_id, const WindowPlan& window,
+                     std::span<const float> logprobs) {
+    if (window.target_end < window.target_begin ||
+        logprobs.size() != window.target_end - window.target_begin) {
+        throw std::invalid_argument("token NLL target count differs from the scoring window");
+    }
+    for (const float logprob : logprobs) {
+        if (!std::isfinite(logprob)) {
+            throw std::runtime_error("causal scoring returned a non-finite logprob");
+        }
+    }
+    for (std::size_t index = 0; index < logprobs.size(); ++index) {
+        output << nlohmann::json{{"stream_id", stream_id},
+                                 {"target_index", window.target_begin + index},
+                                 {"nll", -static_cast<double>(logprobs[index])}}
+                      .dump()
+               << '\n';
+    }
+    if (!output) { throw std::runtime_error("cannot write per-token NLL output"); }
+}
+
+void validate_token_nll_destination(const std::filesystem::path& destination,
+                                    std::span<const std::filesystem::path> protected_paths) {
+    const auto normalized =
+        std::filesystem::weakly_canonical(std::filesystem::absolute(destination));
+    for (const auto& protected_path : protected_paths) {
+        const auto protected_normalized =
+            std::filesystem::weakly_canonical(std::filesystem::absolute(protected_path));
+        if (normalized == protected_normalized ||
+            (std::filesystem::exists(normalized) && std::filesystem::exists(protected_normalized) &&
+             std::filesystem::equivalent(normalized, protected_normalized))) {
+            throw std::invalid_argument(
+                "per-token NLL output aliases an input or reserved report: " +
+                destination.string());
+        }
+    }
 }
 
 void ScoreAggregate::add(std::span<const float> logprobs) {

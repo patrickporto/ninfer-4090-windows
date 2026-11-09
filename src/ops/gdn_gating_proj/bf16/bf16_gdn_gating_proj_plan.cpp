@@ -52,6 +52,16 @@ constexpr std::array<RouteSpec, 5> k35Routes{{
     {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
 
+// TP2 rank-local controls (24 heads, replicated 5120 hidden). The MMA tiles require 16-head
+// blocks, so the local shard uses the per-row SIMT kernels: GEMV for decode and the K-split10
+// reduction elsewhere (grid z = ceil(T/8) bounds T at 8*65535).
+inline constexpr std::int32_t kLocalSmallTMaxCols = 8 * 65'535;
+constexpr std::array<RouteSpec, 3> k27LocalRoutes{{
+    {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
+    {{2, kLocalSmallTMaxCols}, Bf16GdnGatingScheduleId::SmallTSplit10},
+    {{kLocalSmallTMaxCols + 1, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+}};
+
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
                                  std::int32_t last) noexcept {
@@ -65,6 +75,7 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
 
 static_assert(catalog_is_closed(k27Routes, kAnyCols));
 static_assert(catalog_is_closed(k35Routes, kAnyCols));
+static_assert(catalog_is_closed(k27LocalRoutes, kAnyCols));
 
 // Device-wide resident-CTA budgets for the sm_89 build: the per-SM occupancy measured on sm_86
 // carries over unchanged (identical register counts and per-SM limits), scaled from 82 to the
@@ -126,6 +137,10 @@ bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 48 && problem.input_rows == 5120;
 }
 
+bool is_27_local(const Bf16GdnGatingProblem& problem) noexcept {
+    return problem.heads == 24 && problem.input_rows == 5120;
+}
+
 bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 32 && problem.input_rows == 2048;
 }
@@ -178,6 +193,12 @@ std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
 bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
                         const Bf16GdnGatingProblem& problem) noexcept {
     if (!bf16_gdn_gating_admits(problem)) { return false; }
+    if (is_27_local(problem)) {
+        if (schedule == Bf16GdnGatingScheduleId::GemvPairedRows) return problem.cols == 1;
+        if (schedule == Bf16GdnGatingScheduleId::SmallTSplit10)
+            return problem.cols >= 2 && problem.cols <= kLocalSmallTMaxCols;
+        return false;
+    }
     if (is_27(problem)) {
         switch (schedule) {
         case Bf16GdnGatingScheduleId::GemvPairedRows:
@@ -377,6 +398,7 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
 
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
     if (problem.cols < 1) { return false; }
+    if (is_27_local(problem)) return problem.cols <= kLocalSmallTMaxCols;
     return is_27(problem) || is_35(problem);
 }
 
@@ -401,7 +423,13 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
         throw std::invalid_argument(
             "BF16 GDN gating: exact problem or column count is not admitted");
     }
-    if (is_27(problem)) {
+    if (is_27_local(problem)) {
+        for (const RouteSpec& route : k27LocalRoutes) {
+            if (route.cols.contains(problem.cols)) {
+                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+            }
+        }
+    } else if (is_27(problem)) {
         for (const RouteSpec& route : k27Routes) {
             if (route.cols.contains(problem.cols)) {
                 return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
@@ -425,6 +453,7 @@ std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::in
     const Bf16GdnGatingProblem base{heads, input_rows, 1};
     (void)bf16_gdn_gating_resolve_plan({heads, input_rows, min_cols});
     (void)bf16_gdn_gating_resolve_plan({heads, input_rows, max_cols});
+    if (is_27_local(base)) return route_capacity(k27LocalRoutes, base, min_cols, max_cols);
     return is_27(base) ? route_capacity(k27Routes, base, min_cols, max_cols)
                        : route_capacity(k35Routes, base, min_cols, max_cols);
 }
@@ -433,7 +462,7 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
     Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
     std::int32_t norm_splits             = 0;
-    if (is_27(problem) && problem.cols <= 42)
+    if ((is_27(problem) || is_27_local(problem)) && problem.cols <= 42)
         return {Bf16GdnNormGatingScheduleId::FusedSimt27, control, 0};
     if (is_35(problem) && problem.cols <= 16) {
         control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
@@ -452,7 +481,7 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
                                                           std::int32_t max_cols) {
     std::size_t maximum =
         bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols);
-    if (heads == 48 && input_rows == 5120) {
+    if ((heads == 48 || heads == 24) && input_rows == 5120) {
         if (max_cols <= 42) return 0;
         return bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, std::max(min_cols, 43),
                                                         max_cols);

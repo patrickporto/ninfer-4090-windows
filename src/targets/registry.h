@@ -11,6 +11,7 @@
 namespace ninfer {
 
 struct DeviceContext;
+class DeviceGroup;
 
 namespace targets {
 
@@ -33,6 +34,8 @@ struct Qwen3_6_27BInstance {
     using Package = Qwen3_6_27B;
 
     std::unique_ptr<LoadedQwen3_6_27B> loaded;
+    std::unique_ptr<Qwen3_6_27B::LoadedModel> pipeline_model;
+    std::array<runtime::KvCapacityResolution, 2> pipeline_capacity;
     runtime::KvCapacityResolution kv_capacity_resolution;
     const std::uint32_t capacity;
     std::unique_ptr<Qwen3_6_27B::Program> program;
@@ -41,6 +44,13 @@ struct Qwen3_6_27BInstance {
                         runtime::KvCapacityResolution resolution,
                         Qwen3_6_27B::SequencePlan sequence_plan, DeviceContext& device,
                         const StartupObserver& startup_observer);
+    // Two-rank PP2 or TP2 instance; `pipeline_model` and `pipeline_capacity` describe rank 1.
+    Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
+        std::unique_ptr<Qwen3_6_27B::LoadedModel> tail_model,
+        std::array<runtime::KvCapacityResolution, 2> resolutions,
+        Qwen3_6_27B::SequencePlan owner_plan, Qwen3_6_27B::SequencePlan tail_plan,
+        DeviceContext& owner_device, DeviceContext& tail_device, const StartupObserver& observer,
+        ParallelMode mode = ParallelMode::Pipeline);
     ~Qwen3_6_27BInstance();
 
     Qwen3_6_27BInstance(const Qwen3_6_27BInstance&)            = delete;
@@ -88,7 +98,7 @@ struct ConstructedTarget {
 };
 
 [[nodiscard]] ConstructedTarget construct_target(const EngineOptions& options,
-                                                 DeviceContext& device);
+                                                 DeviceContext& device, DeviceGroup* group = nullptr);
 
 } // namespace targets
 } // namespace ninfer

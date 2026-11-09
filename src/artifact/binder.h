@@ -37,6 +37,11 @@ struct MaterializationPlan {
     std::vector<HostMaterialization> host_objects;
 };
 
+// Select whole objects and densely repack their device offsets in original plan order.
+// Handles and object_count retain their artifact-global identities.
+MaterializationPlan filter_materialization_plan(
+    const MaterializationPlan& source, std::span<const ObjectHandle> selected);
+
 class Binder {
 public:
     explicit Binder(const Reader& reader);

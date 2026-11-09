@@ -118,6 +118,10 @@ public:
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;
     [[nodiscard]] std::optional<std::string> matched_stop_string() const;
+    // True when the session was opened with a structured-output grammar; the Engine then applies
+    // next_token_bitmask() to the lane's sampling config after every committed round.
+    [[nodiscard]] bool has_token_constraint() const noexcept;
+    [[nodiscard]] std::span<const std::uint32_t> next_token_bitmask();
 
 private:
     class Impl;
@@ -146,8 +150,9 @@ public:
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession
     make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
-                        const OutputOptions& output            = {},
-                        const ThinkingControlOptions& thinking = {}) const;
+                        const OutputOptions& output               = {},
+                        const ThinkingControlOptions& thinking    = {},
+                        const StructuredOutputOptions& structured = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
 
 private:

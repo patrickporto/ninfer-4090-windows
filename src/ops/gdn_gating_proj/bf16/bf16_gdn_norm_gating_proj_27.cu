@@ -6,16 +6,20 @@
 
 #include <cuda_bf16.h>
 
+#include <stdexcept>
+
 namespace ninfer::ops::detail {
 namespace {
 // Each head computes both control dots and the complete norm. RMS scaling can be
 // applied after the dots; h is independently rounded from the full normalized input.
-template <int Tile, int Threads>
+// H is 48 for the full 27B controls or 24 for the TP2 rank-local shard.
+template <int Tile, int Threads, int H = 48>
 __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
     const __nv_bfloat16* x, const __nv_bfloat16* nw, const __nv_bfloat16* aw,
     const __nv_bfloat16* bw, const float* alog, const float* bias, __nv_bfloat16* h, float* g,
     float* beta, int tokens, float eps) {
-    constexpr int D = 5120, H = 48, Warps = Threads / 32;
+    constexpr int D = 5120, Warps = Threads / 32;
+    static_assert((D / 2 + H - 1) / H <= Threads, "h slice must fit one block");
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, head = blockIdx.x,
               first = blockIdx.y * Tile;
     float aa[Tile]{}, bb[Tile]{}, ss[Tile]{};
@@ -74,7 +78,7 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
         }
     }
     __syncthreads();
-    // Disjoint, pair-aligned h slices across the 48 heads avoid a separate norm kernel.
+    // Disjoint, pair-aligned h slices across the H heads avoid a separate norm kernel.
     constexpr int PairsPerHead = (D / 2 + H - 1) / H;
     const int pair             = head * PairsPerHead + tid;
     if (tid < PairsPerHead && pair < D / 2) {
@@ -95,9 +99,12 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
                                          const Tensor& alog, const Tensor& bias, Tensor& g,
                                          Tensor& beta, cudaStream_t stream) {
+    if (a_weight.n != 48 && a_weight.n != 24)
+        throw std::invalid_argument("gdn_norm_gating_proj: fused route requires 48 or 24 heads");
     const auto launch = [&]<int T, int Threads>() {
-        gdn_norm_gating_27_simt<T, Threads>
-            <<<dim3(48, (x.ne[1] + T - 1) / T), Threads, 0, stream>>>(
+        auto kernel = a_weight.n == 48 ? gdn_norm_gating_27_simt<T, Threads, 48>
+                                       : gdn_norm_gating_27_simt<T, Threads, 24>;
+        kernel<<<dim3(a_weight.n, (x.ne[1] + T - 1) / T), Threads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),
                 static_cast<const __nv_bfloat16*>(norm_weight.data),
                 static_cast<const __nv_bfloat16*>(a_weight.qdata),

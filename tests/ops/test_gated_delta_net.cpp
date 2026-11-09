@@ -1,14 +1,23 @@
 #include "ninfer/ops/gated_delta_net.h"
+#include "ninfer/ops/l2norm.h"
 
 #include "ops/gdn_ref.h"
 #include "ops/op_tester.h"
+// Task-local capture diagnosis only; ordinary qualification uses the public Op.
+#include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include <cuda_runtime.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -40,6 +49,92 @@ struct Case {
     bool normalize_qk;
     bool near_zero_qk = false;
 };
+
+constexpr Case kLongCase{"27b measured direct prefill fused-qk-norm", 16, 48, 1024, true};
+constexpr std::uint32_t kLongSeed = 13024u;
+
+struct CapturedInputs {
+    gdn_ref::Inputs represented;
+    std::vector<std::uint16_t> q_bits, k_bits, v_bits;
+};
+
+template <typename T>
+std::vector<T> read_capture_tensor(const std::filesystem::path& path, std::size_t count) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    const auto bytes = static_cast<std::streamsize>(count * sizeof(T));
+    if (!file || file.tellg() != bytes) {
+        throw std::runtime_error("capture missing or unexpected byte count: " + path.string());
+    }
+    file.seekg(0);
+    std::vector<T> values(count);
+    if (!file.read(reinterpret_cast<char*>(values.data()), bytes)) {
+        throw std::runtime_error("capture read failed: " + path.string());
+    }
+    return values;
+}
+
+CapturedInputs load_capture(const std::filesystem::path& directory) {
+    if (!directory.is_absolute() || std::endian::native != std::endian::little) {
+        throw std::runtime_error("capture requires an absolute directory and little-endian host");
+    }
+    std::ifstream manifest_file(directory / "manifest.json");
+    if (!manifest_file) throw std::runtime_error("capture manifest missing");
+    const auto manifest = nlohmann::json::parse(manifest_file);
+    const float scale = 1.0f / std::sqrt(static_cast<float>(kStateDim));
+    const nlohmann::json expected = {
+        {"tokens", 1024}, {"qk_heads", 16}, {"value_heads", 48}, {"head_dim", 128},
+        {"normalize_qk", true}, {"initial_state", "zero"},
+        {"layout", "contiguous fastest dimension first"}, {"byte_order", "little-endian"},
+        {"q_shape", {128, 16, 1024}}, {"k_shape", {128, 16, 1024}},
+        {"v_shape", {128, 48, 1024}}, {"g_shape", {48, 1024}}, {"beta_shape", {48, 1024}},
+        {"output_shape", {128, 48, 1024}}, {"state_shape", {128, 128, 48}}};
+    for (const auto& [key, value] : expected.items()) {
+        if (!manifest.contains(key) || manifest.at(key) != value) {
+            throw std::runtime_error("unsupported capture manifest field: " + key);
+        }
+    }
+    if (manifest.at("scale").get<float>() != scale) {
+        throw std::runtime_error("capture scale differs from represented 1/sqrt(128)");
+    }
+    CapturedInputs capture;
+    auto& in = capture.represented;
+    in.head_dim = 128; in.qk_heads = 16; in.value_heads = 48; in.tokens = 1024;
+    capture.q_bits = read_capture_tensor<std::uint16_t>(directory / "q.bf16", 128 * 16 * 1024);
+    capture.k_bits = read_capture_tensor<std::uint16_t>(directory / "k.bf16", 128 * 16 * 1024);
+    capture.v_bits = read_capture_tensor<std::uint16_t>(directory / "v.bf16", 128 * 48 * 1024);
+    const auto decode = [](const std::vector<std::uint16_t>& bits) {
+        std::vector<float> values(bits.size());
+        std::transform(bits.begin(), bits.end(), values.begin(), bf16_to_f32);
+        return values;
+    };
+    in.q = decode(capture.q_bits);
+    in.k = decode(capture.k_bits);
+    in.v = decode(capture.v_bits);
+    in.g = read_capture_tensor<float>(directory / "g.fp32", 48 * 1024);
+    in.beta = read_capture_tensor<float>(directory / "beta.fp32", 48 * 1024);
+    in.state.assign(128 * 128 * 48, 0.0f);
+    // Only represented inputs are consumed. Saved device outputs/state never
+    // participate in the independent FP64 mathematical reference.
+    std::cout << "GDN capture=" << directory << " T=1024 Hqk=16 Hv=48 D=128"
+              << " normalize_qk=true initial_state=zero scale=" << std::hexfloat << scale
+              << std::defaultfloat << std::endl;
+    return capture;
+}
+
+// Fingerprint represented host inputs so separate device runs can confirm they
+// received identical Q/K/V, gates, beta, and initial state before recurrence.
+std::uint64_t input_fingerprint(const std::vector<float>& values) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (float value : values) {
+        std::uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        for (int byte = 0; byte < 4; ++byte) {
+            hash ^= (bits >> (8 * byte)) & 0xffU;
+            hash *= 1099511628211ULL;
+        }
+    }
+    return hash;
+}
 
 void fill_uniform(std::vector<float>& values, std::mt19937& generator, float low, float high) {
     std::uniform_real_distribution<float> distribution(low, high);
@@ -103,6 +198,15 @@ gdn_ref::Inputs make_inputs(const Case& test_case, std::uint32_t seed) {
     round_to_bf16(in.q);
     round_to_bf16(in.k);
     round_to_bf16(in.v);
+    if (test_case.tokens == kLongCase.tokens) {
+        std::cout << test_case.name << " fixture seed=" << seed
+                  << " T=" << in.tokens << " Hqk=" << in.qk_heads
+                  << " Hv=" << in.value_heads << " D=" << in.head_dim
+                  << " represented-input-fnv1a64 q=" << std::hex << input_fingerprint(in.q)
+                  << " k=" << input_fingerprint(in.k) << " v=" << input_fingerprint(in.v)
+                  << " g=" << input_fingerprint(in.g) << " beta=" << input_fingerprint(in.beta)
+                  << " state=" << input_fingerprint(in.state) << std::dec << std::endl;
+    }
     return in;
 }
 
@@ -149,8 +253,10 @@ int verify_common_inputs_unchanged(const std::string& label, const gdn_ref::Inpu
 }
 
 struct DeviceInputs {
-    explicit DeviceInputs(const gdn_ref::Inputs& in)
-        : q(to_device_bf16(in.q)), k(to_device_bf16(in.k)), v(to_device_bf16(in.v)),
+    explicit DeviceInputs(const gdn_ref::Inputs& in, const CapturedInputs* capture = nullptr)
+        : q(capture ? to_device(capture->q_bits) : to_device_bf16(in.q)),
+          k(capture ? to_device(capture->k_bits) : to_device_bf16(in.k)),
+          v(capture ? to_device(capture->v_bits) : to_device_bf16(in.v)),
           g(to_device_f32(in.g)), beta(to_device_f32(in.beta)) {}
 
     DeviceBuffer q;
@@ -205,12 +311,13 @@ int inplace_case(const Case& test_case, std::uint32_t seed) {
     return failures;
 }
 
-int distinct_state_case(const Case& test_case, std::uint32_t seed) {
-    const gdn_ref::Inputs in = make_inputs(test_case, seed);
+int distinct_state_case(const Case& test_case, std::uint32_t seed,
+                        const CapturedInputs* capture = nullptr) {
+    const gdn_ref::Inputs in = capture ? capture->represented : make_inputs(test_case, seed);
     const float scale        = 1.0f / std::sqrt(static_cast<float>(kStateDim));
     const gdn_ref::Result ref =
         gdn_ref::evaluate(in, static_cast<double>(scale), test_case.normalize_qk);
-    DeviceInputs device(in);
+    DeviceInputs device(in, capture);
     GuardedDeviceBuffer state_in(in.state.size() * sizeof(float));
     GuardedDeviceBuffer state_out(in.state.size() * sizeof(float));
     GuardedDeviceBuffer out(in.v.size() * sizeof(std::uint16_t));
@@ -254,6 +361,96 @@ int distinct_state_case(const Case& test_case, std::uint32_t seed) {
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
+    }
+    const char* direct_diagnostic = std::getenv("NINFER_TEST_GDN_DIRECT_DIAGNOSTIC");
+    if (capture != nullptr && direct_diagnostic != nullptr &&
+        std::string(direct_diagnostic) == "1") {
+        // Diagnostic comparisons retain the ORIGINAL represented-input FP64
+        // reference. In particular, route B's private BF16 normalization is
+        // measured as implementation error, never incorporated in the oracle.
+        DeviceBuffer normalized_q(in.q.size() * sizeof(std::uint16_t));
+        DeviceBuffer normalized_k(in.k.size() * sizeof(std::uint16_t));
+        Tensor q_normalized(normalized_q.p, DType::BF16,
+                            {kStateDim, test_case.qk_heads, test_case.tokens});
+        Tensor k_normalized(normalized_k.p, DType::BF16,
+                            {kStateDim, test_case.qk_heads, test_case.tokens});
+        const auto fingerprint = [](const auto& values) {
+            const auto* bytes = reinterpret_cast<const unsigned char*>(values.data());
+            std::uint64_t hash = 14695981039346656037ULL;
+            for (std::size_t i = 0; i < values.size() * sizeof(values[0]); ++i) {
+                hash ^= bytes[i];
+                hash *= 1099511628211ULL;
+            }
+            return hash;
+        };
+        const auto run_route = [&](const char* name, auto&& launch) {
+            cudaEvent_t start{}, stop{};
+            cuda_check(cudaEventCreate(&start), "diagnostic event create start");
+            cuda_check(cudaEventCreate(&stop), "diagnostic event create stop");
+            float total_ms = 0.0f, minimum_ms = 0.0f, maximum_ms = 0.0f;
+            for (int iteration = 0; iteration < 8; ++iteration) {
+                // Same stream: initial zero state and output poisoning complete
+                // before the start event, outside every measured interval.
+                cuda_check(cudaMemsetAsync(state_in.data(), 0, state_in.bytes(), nullptr),
+                           "diagnostic reset state-in");
+                cuda_check(cudaMemsetAsync(state_out.data(), 0xff, state_out.bytes(), nullptr),
+                           "diagnostic reset state-out");
+                cuda_check(cudaMemsetAsync(out.data(), 0xff, out.bytes(), nullptr),
+                           "diagnostic reset output");
+                cuda_check(cudaEventRecord(start, nullptr), "diagnostic record start");
+                launch();
+                cuda_check(cudaEventRecord(stop, nullptr), "diagnostic record stop");
+                cuda_check(cudaEventSynchronize(stop), "diagnostic synchronize stop");
+                if (iteration >= 3) {
+                    float ms;
+                    cuda_check(cudaEventElapsedTime(&ms, start, stop), "diagnostic elapsed");
+                    total_ms += ms;
+                    minimum_ms = iteration == 3 ? ms : std::min(minimum_ms, ms);
+                    maximum_ms = iteration == 3 ? ms : std::max(maximum_ms, ms);
+                }
+            }
+            cuda_check(cudaEventDestroy(start), "diagnostic destroy start");
+            cuda_check(cudaEventDestroy(stop), "diagnostic destroy stop");
+            const auto output_bits = from_device<std::uint16_t>(out.data(), in.v.size());
+            const auto final_state = from_device<float>(state_out.data(), in.state.size());
+            std::vector<double> output_values(output_bits.size());
+            std::transform(output_bits.begin(), output_bits.end(), output_values.begin(),
+                           [](std::uint16_t value) { return double(bf16_to_f32(value)); });
+            std::cout << "GDN_DIRECT_DIAGNOSTIC route=" << name
+                      << " warmup=3 timed=5 gpu_mean_ms=" << total_ms / 5.0f
+                      << " gpu_min_ms=" << minimum_ms << " gpu_max_ms=" << maximum_ms
+                      << " output_fnv1a64=" << std::hex << fingerprint(output_bits)
+                      << " state_fnv1a64=" << fingerprint(final_state) << std::dec << '\n';
+            const std::string route_label = std::string("captured diagnostic ") + name;
+            int route_failures = verify_recurrence(route_label + " out", output_values,
+                                                   ref.out, gated_delta_net_output_bf16_criterion());
+            route_failures += verify_recurrence(route_label + " state", doubles(final_state),
+                                                ref.final_state, gated_delta_net_state_fp32_criterion());
+            route_failures += verify_exact(route_label + " state-in unchanged",
+                                            from_device<float>(state_in.data(), in.state.size()), in.state);
+            route_failures += state_in.verify_guards((route_label + " state-in").c_str());
+            route_failures += state_out.verify_guards((route_label + " state-out").c_str());
+            route_failures += out.verify_guards((route_label + " out").c_str());
+            return route_failures;
+        };
+        failures += run_route("public-chunk", [&] {
+            ops::gated_delta_net(q, k, v, g, beta, scale, true, workspace,
+                                 state_in_tensor, state_out_tensor, out_tensor, nullptr);
+        });
+        failures += run_route("A-direct-raw-qk-fp32-normalization", [&] {
+            ops::detail::gated_delta_net::launch_recurrent_inout(
+                q, k, v, g, beta, scale, true, state_in_tensor, state_out_tensor, out_tensor, nullptr);
+        });
+        // Route B timing includes both public l2norm calls on every invocation.
+        failures += run_route("B-direct-public-bf16-normalization", [&] {
+            ops::l2norm(q, 1.0e-6f, q_normalized, nullptr);
+            ops::l2norm(k, 1.0e-6f, k_normalized, nullptr);
+            ops::detail::gated_delta_net::launch_recurrent_inout(
+                q_normalized, k_normalized, v, g, beta, scale, false,
+                state_in_tensor, state_out_tensor, out_tensor, nullptr);
+        });
+        failures += verify_common_inputs_unchanged("captured direct diagnostics", in, device.q,
+                                                   device.k, device.v, device.g, device.beta);
     }
     return failures;
 }
@@ -424,12 +621,80 @@ int contract_rejection_cases() {
     return failures;
 }
 
+int direct_prefill_capacity_cases() {
+    const auto capacity = [](int heads, bool normalize, int first, int last) {
+        return ops::gated_delta_net_workspace_capacity_bytes(16, heads, normalize, first, last);
+    };
+    int failures = 0;
+    if (capacity(48, true, 1024, 1024) != 0 ||
+        capacity(48, true, 1023, 1023) == 0 || capacity(48, true, 1025, 1025) == 0 ||
+        capacity(48, false, 1024, 1024) == 0 || capacity(32, true, 1024, 1024) == 0) {
+        std::cerr << "gated_delta_net direct prefill capacity route is not closed to its measured profile\n";
+        ++failures;
+    }
+    const auto interval = capacity(48, true, 1, 1024);
+    const auto last_chunked = capacity(48, true, 1023, 1023);
+    if (interval != last_chunked || capacity(48, true, 1023, 1024) != last_chunked) {
+        std::cerr << "gated_delta_net interval lost the shorter chunk workspace witness\n";
+        ++failures;
+    }
+    for (const bool normalize : {false, true}) {
+        const auto enclosing = capacity(48, normalize, 1, 1024);
+        for (int tokens = 1; tokens <= 1024; ++tokens) {
+            if (capacity(48, normalize, tokens, tokens) > enclosing) {
+                std::cerr << "gated_delta_net interval under-reserved at T=" << tokens << '\n';
+                ++failures;
+                break;
+            }
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
+    const int capacity_failures = direct_prefill_capacity_cases();
+    if (capacity_failures != 0) return 1;
+    if (const char* capacity_only = std::getenv("NINFER_TEST_GDN_CAPACITY_ONLY");
+        capacity_only != nullptr && std::string(capacity_only) == "1") {
+        std::cout << "OK gated_delta_net CPU interval capacity\n";
+        return 0;
+    }
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
+    }
+
+    const char* capture_directory = std::getenv("NINFER_TEST_GDN_CAPTURE_DIR");
+    if (capture_directory != nullptr && capture_directory[0] != '\0') {
+        try {
+            // Capture qualification always reports both frozen criteria and
+            // measured errors, including successful comparisons.
+            if (::setenv("NINFER_OP_REPORT_STATS", "1", 1) != 0) {
+                throw std::runtime_error("could not enable capture error statistics");
+            }
+            const CapturedInputs capture = load_capture(capture_directory);
+            const int failures = distinct_state_case(
+                {"captured 27b recurrence", 16, 48, 1024, true}, 0, &capture);
+            std::cout << (failures == 0 ? "OK" : "FAIL")
+                      << " gated_delta_net captured FP64 recurrence correctness\n";
+            return failures == 0 ? 0 : 1;
+        } catch (const std::exception& error) {
+            std::cerr << "gated_delta_net capture: " << error.what() << '\n';
+            return 1;
+        }
+    }
+
+    // Select the same long qualification case alone for bounded cross-device
+    // diagnosis. It uses the ordinary independent FP64 oracle and frozen suite
+    // criteria; no route, staging cast, or tolerance is changed.
+    const char* long_diagnostic = std::getenv("NINFER_TEST_GDN_LONG_DIAGNOSTIC");
+    if (long_diagnostic != nullptr && std::string(long_diagnostic) == "1") {
+        const int failures = distinct_state_case(kLongCase, kLongSeed);
+        std::cout << (failures == 0 ? "OK" : "FAIL")
+                  << " gated_delta_net long recurrence correctness\n";
+        return failures == 0 ? 0 : 1;
     }
 
     int failures = 0;
@@ -467,6 +732,7 @@ int main() {
     failures += distinct_state_case({"generic grouped-map chunk-tail", 3, 12, 65, true}, 12365u);
     failures += distinct_state_case({"27b two-chunk fused-qk-norm", 16, 48, 128, true}, 12128u);
     failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
+    failures += distinct_state_case(kLongCase, kLongSeed);
 
     // The production decode path updates selected state-pool slots in place at width one.
     failures += batch_update_case({"27b selected-slot fused-qk-norm", 16, 48, 1, true}, {7}, {7}, 8,

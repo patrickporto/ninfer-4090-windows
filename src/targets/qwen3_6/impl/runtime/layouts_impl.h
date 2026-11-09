@@ -112,14 +112,20 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
         checked_i32(static_cast<std::uint64_t>(physical_pages) + mtp_extra_pages,
                     "MTP Paged KV physical pages exceed int32"));
+    const auto layers = runtime_support::StageLayerLayout::create(
+        plan.pipeline_layers.value_or(PhysicalLayerRange{0, TextConfig::layers}), TextConfig::layers);
+    if (plan.pipeline_layers) { layers.require_pipeline_pools(); }
+    // TP2 ranks own only their complete KV-head and GDN-head groups; no full state is retained.
+    const bool tensor = plan.tensor_rank.has_value();
     LayoutBuilder builder;
     PersistentLayout out;
     out.decoder = qwen3_6::plan_decoder_state(
         builder, qwen3_6::DecoderStateSpec{
-                     .full_attention_layers     = TextConfig::full_attention_layers(),
+                     .full_attention_layers     = layers.full_attention_count(),
                      .mtp_layers                = TextConfig::mtp_layers,
                      .capacity                  = plan.capacity,
-                     .kv_heads                  = TextConfig::kv_heads,
+                     .kv_heads                  = tensor ? TensorLocalConfig::kv_heads
+                                                         : TextConfig::kv_heads,
                      .attention_head_dim        = TextConfig::head_dim,
                      .kv_storage                = plan.kv_storage,
                      .enable_mtp                = plan.features.mtp(),
@@ -130,10 +136,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     qwen3_6::StateImageSpec state_image_spec{
         .linear =
             {
-                .layers         = TextConfig::gdn_layers(),
-                .conv_channels  = TextConfig::convolution_dim,
+                .layers         = layers.gdn_count(),
+                .conv_channels  = tensor ? TensorLocalConfig::convolution_dim
+                                         : TextConfig::convolution_dim,
                 .conv_width     = TextConfig::gdn_conv_state_width,
-                .value_heads    = TextConfig::gdn_value_heads,
+                .value_heads    = tensor ? TensorLocalConfig::gdn_value_heads
+                                         : TextConfig::gdn_value_heads,
                 .value_head_dim = TextConfig::gdn_value_head_dim,
                 .key_head_dim   = TextConfig::gdn_key_head_dim,
                 .slot_count     = state_image_slots,
@@ -152,6 +160,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         }
     }
     out.state_images = qwen3_6::plan_state_image_device_pool(builder, state_image_spec);
+    if ((plan.pipeline_layers && plan.pipeline_layers->begin != 0) || plan.tensor_rank == 1U) {
+        out.bytes = builder.finish(kArenaAlign, "pipeline tail persistent layout");
+        out.kv_payload_bytes = out.decoder.kv_payload_bytes();
+        return out;
+    }
     if (plan.speculative_backend != SpeculativeBackend::None) {
         out.replay_records = plan_gdn_replay_records(
             builder, GdnReplayRecordSpec{
@@ -237,6 +250,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.sampling_config = add_tensor(
         builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
         "sampling config");
+    out.token_masks = add_tensor(
+        builder, DType::I32,
+        {(TextConfig::token_domain + 31) / 32, static_cast<std::int32_t>(plan.max_concurrency)},
+        "structured-output token masks");
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
@@ -391,6 +408,37 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
 
     WorkspacePlan out;
+    if (plan.tensor_rank) {
+        // TP2 layers use rank-local Op geometry; owner endpoints (embedding, final norm, head,
+        // sampling and scoring) run between passes on rank 0 and never overlap layer scratch.
+        if (plan.speculative_backend != SpeculativeBackend::None || plan.features.vision ||
+            plan.features.masked_draft()) {
+            throw std::logic_error("TP2 workspace planning requires eager text execution");
+        }
+        out.text_prefill = std::max(
+            tensor_layer_workspace_bytes<Variant>(qwen3_6::TextPhase::Prefill, 1, 1, chunk,
+                                                  plan.kv_storage, text_envelope),
+            ops::sampling_workspace_capacity_bytes(TextConfig::token_domain, 1, 1));
+        for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
+             ++batch) {
+            out.ordinary_round = std::max(
+                {out.ordinary_round,
+                 tensor_layer_workspace_bytes<Variant>(qwen3_6::TextPhase::Verify, batch, batch,
+                                                       batch, plan.kv_storage, text_envelope),
+                 ops::sampling_workspace_capacity_bytes(TextConfig::token_domain, batch, batch)});
+        }
+        if (plan.causal_scoring && plan.tensor_rank == 0U) {
+            WorkspaceLayoutBuilder causal_score;
+            matrix(causal_score, DType::BF16, TextConfig::output_rows,
+                   static_cast<std::int32_t>(kCausalScoreTile));
+            matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
+            matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
+            out.causal_score = finish(causal_score);
+        }
+        out.general_capacity = std::max({out.text_prefill, out.ordinary_round, out.causal_score});
+        out.capacity         = out.general_capacity;
+        return out;
+    }
     WorkspaceLayoutBuilder text_prefill;
     text_common_root(text_prefill, chunk);
     target_body(text_prefill, 1, chunk, qwen3_6::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
@@ -705,15 +753,16 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     }
-    if (device.compute_capability() != 89) {
-        throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 8.9");
+    if (!runtime_support::compiled_groupwise_device(device.compute_capability(),
+                                                     NINFER_COMPILED_SM89, NINFER_COMPILED_SM120)) {
+        throw std::invalid_argument("Qwen3.6 family runtime has no compiled code for this device");
     }
-    // Upstream's NVFP4-valued KV modes need FP4 tensor cores; the sm_89 build carries their
-    // kernels only as stubs (ops/nvfp4_sm86_stubs.cpp), so refuse them before any allocation.
+    // This build still uses the A16 fallback and stubbed FP4 KV routes on both compiled
+    // architectures; device capability alone does not qualify those routes.
     if (options.kv_cache == KvCacheStorage::Nvfp4Group16 ||
         options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value) {
         throw std::invalid_argument(
-            "nvfp4 and k8v4 KV-cache storage require compute capability 12.0");
+            "nvfp4 and k8v4 KV-cache storage are unavailable in this build");
     }
 }
 
@@ -743,6 +792,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->causal_scoring      = inputs.causal_scoring;
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
+    impl->pipeline_layers     = inputs.pipeline_layers;
+    impl->tensor_rank         = inputs.tensor_rank;
     impl->kv_storage          = inputs.kv_storage;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
@@ -801,6 +852,17 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->device_reservation_bytes = checked_add(
         checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
         impl->graph_allowance_bytes, "sequence graph allowance");
+    if (impl->pipeline_layers) {
+        impl->device_reservation_bytes = checked_add(impl->device_reservation_bytes,
+            PipelineBufferLayout::make(impl->prefill_chunk).bytes, "pipeline stable buffers");
+    }
+    if (impl->tensor_rank) {
+        impl->device_reservation_bytes = checked_add(
+            checked_add(impl->device_reservation_bytes,
+                        PipelineBufferLayout::make(impl->prefill_chunk, true).bytes,
+                        "tensor stable buffers"),
+            kTensorCommunicationAllowanceBytes, "tensor communication allowance");
+    }
     return impl;
 }
 
@@ -808,8 +870,20 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 
 std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>>
 make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
-                           WeightsProfile weights_profile) {
+                           WeightsProfile weights_profile,
+                           std::optional<PhysicalLayerRange> pipeline_layers,
+                           std::optional<std::uint32_t> tensor_rank) {
     validate_target_options(device, options);
+    if (pipeline_layers) {
+        runtime_support::StageLayerLayout::create(*pipeline_layers, TextConfig::layers)
+            .require_pipeline_pools();
+        runtime_support::require_pipeline_eager_options(options);
+    }
+    if (tensor_rank) {
+        if (pipeline_layers || *tensor_rank > 1)
+            throw std::invalid_argument("TP2 rank plans cover all layers on rank 0 or 1");
+        runtime_support::require_tensor_eager_options(options);
+    }
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,
@@ -823,8 +897,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
-        .device              = options.device,
+        .device              = device.device,
         .context_cache       = options.context_cache,
+        .pipeline_layers     = pipeline_layers,
+        .tensor_rank         = tensor_rank,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);

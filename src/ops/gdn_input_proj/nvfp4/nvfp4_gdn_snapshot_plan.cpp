@@ -14,12 +14,13 @@ struct Nvfp4GdnProjectedWorkspace {
 };
 
 template <class Allocator>
-Nvfp4GdnProjectedWorkspace allocate_workspace(Allocator& allocator, std::int32_t tokens) {
+Nvfp4GdnProjectedWorkspace allocate_workspace(Allocator& allocator, LinearPolicy policy,
+                                              std::int32_t tokens) {
     Nvfp4GdnProjectedWorkspace out;
     out.projected = allocator.alloc(DType::BF16, {10240, tokens}, 256);
     const std::size_t projection_bytes =
-        nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4, tokens, tokens);
-    out.projection = allocator.alloc_bytes(projection_bytes, 256);
+        nvfp4_gdn_input_workspace_capacity_bytes(policy, tokens, tokens);
+    if (projection_bytes != 0) { out.projection = allocator.alloc_bytes(projection_bytes, 256); }
     return out;
 }
 
@@ -37,7 +38,8 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
     if (policy == LinearPolicy::A16Only) {
         if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
         if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
-        throw std::invalid_argument("nvfp4 gdn conv A16 is registered only through T=16");
+        // No fused A16 schedule exists past T=16; fall back to chunked A16 projection + post.
+        return {Nvfp4GdnConvScheduleId::Materialized};
     }
     if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
     if (tokens <= 3) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
@@ -55,7 +57,7 @@ std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
     if (maximum_plan.schedule != Nvfp4GdnConvScheduleId::Materialized) { return 0; }
 
     WorkspaceLayoutBuilder layout;
-    (void)allocate_workspace(layout, max_tokens);
+    (void)allocate_workspace(layout, policy, max_tokens);
     return layout.peak_bytes(1);
 }
 
@@ -81,10 +83,15 @@ void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Te
     }
 
     auto scope                         = workspace.scope();
-    Nvfp4GdnProjectedWorkspace scratch = allocate_workspace(workspace, x.ne[1]);
-    WorkspaceArena projection_workspace(scratch.projection);
-    nvfp4_gdn_input_dispatch(x, weight, scratch.projected, z, LinearPolicy::AllowA4,
-                             &projection_workspace, stream);
+    Nvfp4GdnProjectedWorkspace scratch = allocate_workspace(workspace, policy, x.ne[1]);
+    if (scratch.projection.bytes == 0) {
+        // The A16 projection needs no scratch; the borrowed-arena contract rejects empty storage.
+        nvfp4_gdn_input_dispatch(x, weight, scratch.projected, z, policy, nullptr, stream);
+    } else {
+        WorkspaceArena projection_workspace(scratch.projection);
+        nvfp4_gdn_input_dispatch(x, weight, scratch.projected, z, policy, &projection_workspace,
+                                 stream);
+    }
     nvfp4_gdn_snapshot_post_launch(scratch.projected, conv_weight, conv_states, valid_columns,
                                    initial_slot, snapshot_base_slot, query, key, value, stream);
 }

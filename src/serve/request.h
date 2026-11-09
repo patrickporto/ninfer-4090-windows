@@ -51,6 +51,7 @@ enum class ContentKind {
     Text,
     Image,
     Video,
+    Document,
 };
 
 struct CacheBoundary {
@@ -69,7 +70,7 @@ struct CacheBoundary {
 
 struct ContentPart {
     ContentKind kind = ContentKind::Text;
-    std::string text;     // populated for Text
+    std::string text;     // Text content, or Document title/context metadata
     std::string type_raw; // original wire "type" string for diagnostics
     ninfer::product::media_acquire::Source source;
     ninfer::ImageResizePolicy image_resize_policy = ninfer::ImageResizePolicy::Downsize;
@@ -123,6 +124,25 @@ struct SamplingParams {
     std::optional<double> presence_penalty;
     std::optional<double> frequency_penalty;
     std::optional<std::uint64_t> seed;
+};
+
+enum class ResponseFormatMode : std::uint8_t {
+    Text,
+    JsonObject,
+    JsonSchema,
+};
+
+// Wire-normalized structured-output contract. The schema stays serialized at
+// the serve boundary so the Engine API does not acquire a JSON-library type.
+struct ResponseFormat {
+    ResponseFormatMode mode = ResponseFormatMode::Text;
+    std::string name;
+    std::string schema_json;
+    bool strict = false;
+
+    [[nodiscard]] bool constrained() const noexcept {
+        return mode != ResponseFormatMode::Text;
+    }
 };
 
 // Protocol-level effort vocabulary. Each wire adapter accepts the values from
@@ -186,6 +206,7 @@ struct GenerationRequest {
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool allow_engine_automatic_shared_prefixes = true;
     SamplingParams sampling;
+    ResponseFormat response_format;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;

@@ -20,6 +20,10 @@ endfunction()
 add_library(ninfer_core STATIC
   core/arena.cu
   core/device.cu
+  core/device_group.cpp
+  core/tensor_collective.cpp
+  core/cuda_function_config.cpp
+  core/peer_transfer.cu
   core/dtype.cpp
   core/host_worker_pool.cpp
   core/gdn_replay_records.cpp
@@ -38,12 +42,20 @@ add_library(ninfer_core STATIC
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3)
+target_compile_definitions(ninfer_core PUBLIC
+  NINFER_HAS_NCCL=$<BOOL:${NINFER_ENABLE_NCCL}>
+  NINFER_COMPILED_SM89=${NINFER_CUDA_HAS_SM89}
+  NINFER_COMPILED_SM120=${NINFER_CUDA_HAS_SM120})
+if(NINFER_ENABLE_NCCL)
+  target_link_libraries(ninfer_core PUBLIC ninfer_nccl)
+endif()
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
   artifact/reader.cpp
   artifact/storage_layouts.cpp
   artifact/binder.cpp
+  artifact/partition.cpp
   artifact/materializer.cpp
   artifact/typed_binding.cpp)
 ninfer_internal_includes(ninfer_artifact)
@@ -231,6 +243,10 @@ add_library(ninfer_ops STATIC
   ops/linear_add/w8/w8_linear_add_gemm_splitk.cu
   ops/linear_add/w8/w8_linear_add_plan.cpp
   ops/common/act_quant_g64.cu
+  ops/tensor_parallel/tensor_projection.cpp
+  ops/tensor_parallel/tensor_projection.cu
+  ops/tensor_parallel/tensor_projection_gemv.cu
+  ops/tensor_parallel/tensor_residual_add.cu
   ops/common/int8_proj_launch.cu
   ops/linear_add/q5/q5_linear_add_int8.cu
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_int8.cu
@@ -317,7 +333,9 @@ add_library(ninfer_ops STATIC
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/target_logprobs.cpp
   ops/wrapper/vision_pos_embed.cpp)
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "86" OR CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
+# The closed Ada/Blackwell groupwise build deliberately shares the A16 NVFP4
+# fallback and omits FP4 tensor-core/cache routes, including in mixed builds.
+if(NINFER_CUDA_HAS_SM89 OR NINFER_CUDA_HAS_SM120)
   get_target_property(ninfer_ops_sources ninfer_ops SOURCES)
   list(FILTER ninfer_ops_sources EXCLUDE REGEX "nvfp4/.+_w4a4\\.cu$")
   # The NVFP4-valued KV-cache kernels quantize with cvt.e2m1x2 (sm_100+). Their launchers are
@@ -394,10 +412,16 @@ target_link_libraries(ninfer_engine
     ninfer_core
     ninfer_ops
     ninfer_text
-    ninfer_media_decode)
+    ninfer_media_decode
+    ninfer_xgrammar)
 add_library(ninfer::engine ALIAS ninfer_engine)
 
 if(NINFER_BUILD_SERVE)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(POPPLER REQUIRED IMPORTED_TARGET poppler-glib>=0.82)
+  add_library(ninfer_pdf_document STATIC product/document/pdf.cpp)
+  ninfer_internal_includes(ninfer_pdf_document)
+  target_link_libraries(ninfer_pdf_document PUBLIC PkgConfig::POPPLER)
   # HTTP protocol/product adapter. No serving header is part of the public API.
   add_library(ninfer_serve STATIC
     serve/http_transport.cpp
@@ -414,6 +438,7 @@ if(NINFER_BUILD_SERVE)
     serve/anthropic_messages_http.cpp
     serve/openai_responses_store.cpp
     serve/translate.cpp
+    serve/document_input.cpp
     serve/generation_service.cpp
     serve/request_events.cpp
     serve/operational_log.cpp
@@ -427,5 +452,5 @@ if(NINFER_BUILD_SERVE)
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
-    PRIVATE ninfer_media_acquire ninfer_product_logging ${NINFER_CUDART_TARGET})
+    PRIVATE ninfer_media_acquire ninfer_pdf_document ninfer_product_logging ${NINFER_CUDART_TARGET})
 endif()

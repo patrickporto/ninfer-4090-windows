@@ -1,0 +1,28 @@
+# Validate before compiler detection. Blackwell's architecture-specific FP8 MMA
+# requires compute_120a, not the generic compute_120 fallback emitted by -arch.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to build")
+endif()
+set(NINFER_CUDA_HAS_SM89 0)
+set(NINFER_CUDA_HAS_SM120 0)
+if(NOT CMAKE_CUDA_ARCHITECTURES)
+  message(FATAL_ERROR "NInfer requires an explicit supported CUDA architecture")
+endif()
+foreach(ninfer_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+  if(ninfer_arch STREQUAL "89" OR ninfer_arch STREQUAL "89-real")
+    if(NINFER_CUDA_HAS_SM89)
+      message(FATAL_ERROR "Duplicate NInfer CUDA architecture: sm_89")
+    endif()
+    set(NINFER_CUDA_HAS_SM89 1)
+  elseif(ninfer_arch STREQUAL "120a-real")
+    if(NINFER_CUDA_HAS_SM120)
+      message(FATAL_ERROR "Duplicate NInfer CUDA architecture: sm_120a")
+    endif()
+    set(NINFER_CUDA_HAS_SM120 1)
+  else()
+    message(FATAL_ERROR
+      "NInfer groupwise builds support 89, 89-real and 120a-real; got '${ninfer_arch}'. "
+      "For a 4090/5070 Ti build use '89-real;120a-real'.")
+  endif()
+endforeach()
+unset(ninfer_arch)

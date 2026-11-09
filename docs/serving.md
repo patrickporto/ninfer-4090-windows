@@ -154,7 +154,11 @@ The endpoint supports:
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to both reasoning and answer output;
-- `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
+- `n:1` and text-only `modalities`;
+- `response_format` `{"type":"text"}`, `{"type":"json_object"}`, and
+  `{"type":"json_schema","json_schema":{"name","schema","strict"}}`, enforced token-by-token
+  through an XGrammar grammar mask applied at sampling (speculative decoding is preserved; the
+  mask governs the first verify position of each round);
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
 - llama.cpp-compatible terminal `timings`, plus opt-in `timings_per_token` and
@@ -168,14 +172,14 @@ The endpoint supports:
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
-behavior. This includes JSON constrained output, nonzero `logit_bias`, requested log probabilities,
-audio/file input or audio output, `strict:true`, required or named tool choice,
+behavior. This includes nonzero `logit_bias`, requested log probabilities,
+audio/non-PDF file input or audio output, `strict:true`, required or named tool choice,
 `parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
 Known constrained-decoding aliases (`grammar`, `structured_outputs`, `guided_json`, `guided_regex`,
 `guided_choice`, and `guided_grammar`) receive the same explicit rejection instead of being treated
-as unknown hints.
+as unknown hints; constrained output is available only through `response_format`.
 
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
 `logit_bias`, `logprobs:false`, `top_logprobs:0`, `verbosity:"medium"`, empty legacy tool controls,
@@ -213,7 +217,8 @@ case-insensitive boolean text is normalized to `true` or `false`. A nonempty sch
 a structured call: valid JSON retains its represented type and other text becomes a JSON string so
 the tool consumer can report the validation error and continue the agent loop. Schemas without a
 supported explicit type retain untyped inference. NInfer does not apply defaults, enforce required
-properties, perform recursive JSON Schema validation, or use constrained decoding.
+properties, or perform recursive JSON Schema validation. Constrained decoding is available only
+through `response_format` and does not apply to tool-call markup.
 
 String parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
@@ -472,7 +477,7 @@ wire response contains typed `output` Items.
 | `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
-| `text.format` | omitted or `{"type":"text"}` only |
+| `text.format` | omitted, `{"type":"text"}`, `{"type":"json_object"}`, or `{"type":"json_schema","name","schema","strict"}`; JSON modes are enforced by the grammar mask described under Chat Completions |
 | `tools` | direct function definitions or namespace groups containing function definitions; see below |
 | `tool_choice` | `auto`, `none`, or function-only `allowed_tools` with mode `auto`; a namespaced selection carries both `namespace` and `name` |
 | `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
@@ -524,7 +529,7 @@ An `input_text`, `input_image`, or tool-result part may carry
 identity or output semantics. String message status/phase metadata is accepted but has no Qwen
 prompt representation.
 
-`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning metadata without raw
+`input_audio`, image `file_id`, non-`auto` image detail, reasoning metadata without raw
 reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
 stored in a response chain are fetched again when that chain is continued; use data URIs when the
 historical media bytes must be immutable.
@@ -742,7 +747,8 @@ remains usable across serve restarts.
 `display:"omitted"` is rejected because NInfer cannot provide Anthropic's
 encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInfer extension for
 closed-turn Qwen reasoning history. `output_config.effort` is checked against the loaded template's
-declared effort capability.
+declared effort capability. `output_config.format` accepts `{"type":"json_schema","schema"}`,
+enforced by the same XGrammar grammar mask as the OpenAI `response_format`.
 
 User-defined, non-strict tools support `name`, `description`, object `input_schema`, and
 `input_examples`. `tool_choice:auto` and `none` are executable. Forced or named choice,
@@ -769,7 +775,7 @@ emits `message_start` after Engine admission commits the prefix selection and be
 transfer/prefill output, so its uncached/cache-read split is already exact; terminal cumulative
 usage matches the aggregate response.
 
-Documents, Search Results, Files, Structured Outputs, server-tool results, container uploads, and
+Search Results, stored Files, server-tool results, container uploads, and
 other execution-dependent blocks are rejected with the missing capability identified. Metadata,
 service tier, inference geography, protocol-version/beta headers, cache TTL, and unknown advisory
 fields do not block an otherwise executable request. The request `model` is any non-empty local
@@ -1065,3 +1071,24 @@ decoding.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.
+
+## PDF document input
+
+PDFs are decoded in memory with Poppler, before tokenization, using the same acquisition,
+remote-URL policy, request deadline, cancellation and aggregate media-byte budget as images.
+Install the Poppler GLib development package when building natively (`poppler-glib` pkg-config).
+The Docker image includes the build and runtime dependencies.
+
+- Chat Completions: user/tool content part `{"type":"file","file":{"filename":"report.pdf","file_data":"data:application/pdf;base64,..."}}`.
+- Responses: user message content part `{"type":"input_file","filename":"report.pdf","file_data":"data:application/pdf;base64,..."}`. Function-call output content also accepts this part.
+- Anthropic Messages: user `document` block with `source:{"type":"base64","media_type":"application/pdf","data":"..."}`.
+- OpenAI file parts also accept raw base64 `file_data` or an HTTP(S) `file_url` instead. Anthropic supports `source:{"type":"url","url":"https://..."}`.
+
+Text is extracted page by page. With `--vision`, pages are additionally rendered to PNG at
+1280 pixels on the longest side and passed through the existing image path, allowing scanned
+pages and visual layouts to be read. Without Vision, pages with no extractable text are rejected
+explicitly. Rendered images remain subject to the Engine's image/token limits.
+
+Each PDF is limited to 32 MiB; all PDFs in one request share a 64-page and 16 MiB extracted/rendered
+output budget. Encrypted PDFs must be unlocked by the client before upload. Persistent `file_id`,
+PDF citations and password fields are not implemented. PDF bytes are not written to temporary files.

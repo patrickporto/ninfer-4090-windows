@@ -7,6 +7,7 @@
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_bf16.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8.cuh"
+#include "core/cuda_function_config.h"
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/softmax_attention.h"
 
@@ -139,14 +140,12 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         constexpr std::size_t kDynamicBytes =
             DynamicArena ? static_cast<std::size_t>(4 * KeyBlock * kCausalHeadDim) : 0ULL;
         if constexpr (DynamicArena) {
-            static const cudaError_t attr = cudaFuncSetAttribute(
-                causal_attention_small_t_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
-                                                         MinBlocksPerSm, KeyBlock, DynamicArena,
-                                                         PackedV, RotateK, RotateV, PackedK,
-                                                         E8Lattice, E8Root, MultiBatch, Masked,
-                                                         CacheInput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
-            CUDA_CHECK(attr);
+            configure_cuda_shared_memory(
+                causal_attention_small_t_i8_tiled_kernel<
+                    Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm, KeyBlock, DynamicArena,
+                    PackedV, RotateK, RotateV, PackedK, E8Lattice, E8Root, MultiBatch, Masked,
+                    CacheInput>,
+                static_cast<int>(kDynamicBytes));
         }
         causal_attention_small_t_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
                                                  KeyBlock, DynamicArena, PackedV, RotateK, RotateV,
@@ -222,11 +221,15 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
                                              KvCacheStorage cache_storage,
                                              CausalAttentionExecutionEnvelope envelope,
                                              std::int32_t batch_size) {
-    if (tokens < 1 || tokens > (q_heads == 24 ? 8 : 6) || envelope.min_visible_keys == 0 ||
+    if (tokens < 1 || tokens > ((q_heads == 24 || q_heads == 12) ? 8 : 6) ||
+        envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("causal_softmax_attention split capacity: invalid profile");
     }
     (void)paged_kv_storage_layout(cache_storage, kCausalHeadDim);
+    if (q_heads == CausalD256H12Kv2::QHeads) {
+        return causal_small_t_launch_capacity<CausalD256H12Kv2>(envelope, tokens, cache_storage);
+    }
     if (q_heads == CausalD256H24Kv4::QHeads) {
         const int capacity =
             causal_small_t_launch_capacity<CausalD256H24Kv4>(envelope, tokens, cache_storage);
@@ -276,7 +279,12 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
         const auto launch_profile = [&]<bool MultiBatch, bool Masked>() {                          \
             if (kv_storage_is_int8_family(cache.storage)) {                                       \
                 const KvForkModeFlags mode = kv_fork_mode_flags(cache.storage);                    \
-                if (mode.e8_root) {                                                                \
+                if constexpr (Geometry::QHeads == CausalD256H12Kv2::QHeads) {                      \
+                    launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, true, true, false,  \
+                                         MultiBatch, Masked>(                                      \
+                        q, input, pos, scale, cache, invocation, logical_capacity,                 \
+                        implementation_window, splits, partial_acc, partial_m, partial_l, stream); \
+                } else if (mode.e8_root) {                                                         \
                     launch_tc_partial_i8<Geometry, (TOKENS), true, true, true, false, false, true,  \
                                          MultiBatch, Masked>(                                      \
                         q, input, pos, scale, cache, invocation, logical_capacity,                 \
@@ -342,13 +350,13 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
         NINFER_CAUSAL_SMALL_T_DISPATCH(6, 4);
         break;
     case 7:
-        if constexpr (Geometry::QHeads == 24) {
+        if constexpr (Geometry::GroupSize == 6) {
             NINFER_CAUSAL_SMALL_T_DISPATCH(7, 4);
             break;
         }
         throw std::invalid_argument("unsupported query-row tile");
     case 8:
-        if constexpr (Geometry::QHeads == 24) {
+        if constexpr (Geometry::GroupSize == 6) {
             NINFER_CAUSAL_SMALL_T_DISPATCH(8, 4);
             break;
         }
@@ -359,7 +367,7 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
 #undef NINFER_CAUSAL_SMALL_T_DISPATCH
 
     constexpr int kReduceBlock = 256;
-    constexpr int kDChunk      = Geometry::QHeads == 24 ? 256 : 64;
+    constexpr int kDChunk      = Geometry::GroupSize == 6 ? 256 : 64;
     const auto launch_reduce   = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
         const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, kDChunk),
                           invocation.width * invocation.batch_size);
@@ -443,6 +451,12 @@ void causal_attention_small_t_launch(
         .width         = width,
         .batch_size    = q.ne[3],
     };
+    if (q.ne[1] == CausalD256H12Kv2::QHeads) {
+        causal_attention_small_t_launch_for<CausalD256H12Kv2>(q, input, pos, scale, cache,
+                                                              invocation, envelope, partial_acc,
+                                                              partial_m, partial_l, out, stream);
+        return;
+    }
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_launch_for<CausalD256H24Kv4>(q, input, pos, scale, cache,
                                                               invocation, envelope, partial_acc,
@@ -484,6 +498,12 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
         .batch_size    = 1,
     };
     const PagedKVBatchLayerView batch_cache = single_row_paged_kv_batch_view(cache);
+    if (q.ne[1] == CausalD256H12Kv2::QHeads) {
+        causal_attention_small_t_launch_for<CausalD256H12Kv2>(q, input, pos, scale, batch_cache,
+                                                              invocation, envelope, partial_acc,
+                                                              partial_m, partial_l, out, stream);
+        return;
+    }
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_launch_for<CausalD256H24Kv4>(q, input, pos, scale, batch_cache,
                                                               invocation, envelope, partial_acc,

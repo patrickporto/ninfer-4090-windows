@@ -343,8 +343,13 @@ collapses prose acceptance to 24%. It also pins the v3 artifact gate to upstream
 2. soohl INT8 dense prefill: kernel-bench + temp-0 quality gate (unchanged).
 3. DFlash2 only after the quality gate (greedy text differs from MTP3) and a fit decision (224K no
    vision or 192K + vision on 24 GB).
-4. Parked: the two #9 robustness follow-ups; gzenz tool-call pair and the UDP structured-JSON port,
-   re-judged against upstream #294/#299 at catch-up #4.
+4. Parked: the two #9 robustness follow-ups and the gzenz tool-call pair, re-judged against
+   upstream #294/#299 at catch-up #4.
+5. DONE (this tree, Windows port): UDP structured-JSON design port landed — XGrammar v0.2.5.post1
+   grammar mask (`response_format` json_object/json_schema on Chat Completions, `text.format` on
+   Responses, `output_config.format` on Anthropic Messages), MTP preserved with the mask scoped to
+   the first verify position, re-homed from the removed `concurrent_executor.h` onto EngineCore
+   hooks and per-round host-ingress sampling republication.
 
 Hand-off for the next session: `ninfer-recon-notes/HANDOFF.md` top (2026-09-22).
 
@@ -572,3 +577,42 @@ configuration. The plan of record is to converge on one repository with two
 architecture profiles (`sm_89` and `sm_120a` behind a CMake switch) and retire
 the second tree to a deploy configuration. Until then, this ledger is the
 source of truth for coverage.
+
+
+## Linux RTX 4090 qualification — 2026-11-09
+
+Compared ByronLeeeee/ninfer-extended `7646024`, star1872/ninfer-offload `1fd5c39`, and
+UDPSendToFailed/ninfer-4090 `5c60b7c` against the deployed v2 Qwen3.8-27B artifact and
+local PDF/XGrammar changes. The second GPU was not used during this qualification.
+
+Adopted: the `--token-nll` idea from offload `60fd7b9a`, adapted to escaped JSONL records
+(`stream_id`, absolute `target_index`, FP32-preserving `nll`), plus existing rotated/E8
+KV choices in the scorer. Export refuses aliases of input artifacts/text/corpus files and
+reserved report outputs. CPU tests cover normal paths, symlinks, hardlinks and output errors.
+A real rk4v4-e8 scoring run exported 109 unique targets, total NLL 311.6133615032013,
+exactly matching the aggregate report; the CLI rejected overwriting its input fixture.
+
+Evaluated but not adopted: Q4 ping-pong/T=1 draft projection, Q4/Q5 small-T attention MMA,
+physical-SM attention split caps, and blocking CUDA synchronization. Numerical/graph checks
+passed, including independent FP64 projection and attention cases, but end-to-end results did
+not establish a stable speed improvement on this Linux/CUDA 13.2 build. All those CUDA/core
+changes were restored to the prior implementation; the pre-existing JSON/PDF work remains.
+The unsafe thread-local stream fork/join implementation was not transplanted.
+
+Benchmark: RTX 4090, 256K E8 cache, MTP3, indexed draft head, vision capacity 4096, greedy,
+thinking off, one warmup and three 512-token repetitions per workload. Full CUDA candidate
+changed prose/code TPS by +1.5%/+7.4%, but 12,038/6,638-token prompts lost 7.0%/5.7% and MTP
+acceptance changed. Reverting attention projections restored the first three workloads'
+outputs/acceptance, while the 6,638-token SM-cap case still fell 149.0 → 142.3 tok/s.
+Ordinary AR at 6,638 tokens measured 50.8 → 50.5 tok/s, also no useful gain.
+
+The selected implementation reproduced all four baseline outputs and draft counts. Medians
+were 136.4, 128.6, 144.1, 149.5 tok/s, versus 135.7, 128.4, 144.1, 149.0 previously; the below-1%
+differences are not claimed as speedups. Raw cases and rejected source variants are retained
+under `local-test/ada-upgrade/`. The evaluated candidate passed 14 focused tests and additional
+FP64 attention frontiers; selected NLL/device tests and all three API/PDF interfaces passed.
+During candidate qualification, the 259,112-token retrieval fixture returned all three keys correctly (156.8s overall).
+
+Extended OCR/ASR/embedding services, MoE CPU offload, Windows residency/DirectStorage, artifact v3
+migration and larger context windows are not included. TP/PP implementation is tracked by the
+active parallelism plan and starts from this preserved single-GPU baseline.

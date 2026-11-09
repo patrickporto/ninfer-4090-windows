@@ -530,6 +530,12 @@ PendingBatch<Variant> Program<Variant>::decode(std::span<const SequenceHandle<Va
 }
 
 template <>
+void Program<Variant>::set_token_mask_lane(std::uint32_t lane,
+                                           std::span<const std::uint32_t> mask) {
+    impl_->set_token_mask_lane(lane, mask);
+}
+
+template <>
 runtime::ExecutionTiming Program<Variant>::append_forced_tokens(
     std::span<const SequenceHandle<Variant>> sequences, std::span<const TokenId> row_major_tokens,
     std::uint32_t row_stride, std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
@@ -595,6 +601,11 @@ PhysicalUsageSnapshot Program<Variant>::physical_usage() const noexcept {
 }
 
 template <>
+bool Program<Variant>::execution_failed() const noexcept {
+    return impl_->pipeline && impl_->pipeline->failed;
+}
+
+template <>
 MemorySummary Program<Variant>::memory_summary() const noexcept {
     return impl_->memory_summary();
 }
@@ -650,9 +661,11 @@ SessionSnapshotTraffic Program<Variant>::session_snapshot_traffic() const noexce
 template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
-                                                        Variant::WeightsProfile weights_profile) {
+                                                        Variant::WeightsProfile weights_profile,
+                                                        std::optional<PhysicalLayerRange> pipeline_layers,
+                                                        std::optional<std::uint32_t> tensor_rank) {
     return SequencePlanner<Variant>(detail::NINFER_QWEN36_RUNTIME_NS::make_sequence_planner_impl(
-        device, options, weights_profile));
+        device, options, weights_profile, pipeline_layers, tensor_rank));
 }
 
 template <>
@@ -661,6 +674,12 @@ create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile
                         SequencePlan<Variant>&& plan, DeviceContext& device,
                         const StartupObserver& startup_observer) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
+    if (plan.impl_->pipeline_layers) {
+        throw std::invalid_argument("M2 stage plans require the pipeline Program coordinator");
+    }
+    if (plan.impl_->tensor_rank) {
+        throw std::invalid_argument("TP2 rank plans require the tensor Program coordinator");
+    }
     if (plan.impl_->weights_profile != weights_profile) {
         throw std::invalid_argument(
             "loaded model weights profile does not match the sequence plan");
@@ -668,6 +687,57 @@ create_program<Variant>(const Variant::ModelView& model, Variant::WeightsProfile
     auto impl = std::make_unique<detail::ProgramImpl<Variant>>(model, *plan.impl_, device,
                                                                startup_observer);
     plan.impl_.reset();
+    return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
+}
+
+template <>
+std::unique_ptr<Program<Variant>> create_pipeline_program<Variant>(
+    const Variant::ModelView& owner_model, const Variant::ModelView& tail_model,
+    Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& owner_plan,
+    SequencePlan<Variant>&& tail_plan, DeviceContext& owner_device, DeviceContext& tail_device,
+    const StartupObserver& observer) {
+    if (!owner_plan.impl_ || !tail_plan.impl_ || !owner_plan.impl_->pipeline_layers ||
+        !tail_plan.impl_->pipeline_layers || owner_plan.impl_->pipeline_layers->begin != 0 ||
+        owner_plan.impl_->pipeline_layers->end != tail_plan.impl_->pipeline_layers->begin ||
+        tail_plan.impl_->pipeline_layers->end != Variant::TextConfig::layers ||
+        owner_plan.impl_->weights_profile != weights_profile ||
+        tail_plan.impl_->weights_profile != weights_profile ||
+        owner_plan.impl_->main_page_groups != tail_plan.impl_->main_page_groups ||
+        owner_plan.impl_->max_concurrency != tail_plan.impl_->max_concurrency ||
+        owner_device.device == tail_device.device) {
+        throw std::invalid_argument("pipeline Program requires matching local stage plans");
+    }
+    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(owner_model, *owner_plan.impl_,
+                                                              owner_device, observer);
+    impl->initialize_pipeline(tail_model, *owner_plan.impl_, *tail_plan.impl_, tail_device);
+    owner_plan.impl_.reset();
+    tail_plan.impl_.reset();
+    return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
+}
+
+template <>
+std::unique_ptr<Program<Variant>> create_tensor_program<Variant>(
+    const Variant::ModelView& owner_model, const Variant::ModelView& tail_model,
+    Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& owner_plan,
+    SequencePlan<Variant>&& tail_plan, DeviceContext& owner_device, DeviceContext& tail_device,
+    const StartupObserver& observer) {
+    if (!owner_plan.impl_ || !tail_plan.impl_ || owner_plan.impl_->tensor_rank != 0U ||
+        tail_plan.impl_->tensor_rank != 1U || owner_plan.impl_->pipeline_layers ||
+        tail_plan.impl_->pipeline_layers ||
+        owner_plan.impl_->weights_profile != weights_profile ||
+        tail_plan.impl_->weights_profile != weights_profile ||
+        owner_plan.impl_->main_page_groups != tail_plan.impl_->main_page_groups ||
+        owner_plan.impl_->max_concurrency != tail_plan.impl_->max_concurrency ||
+        owner_plan.impl_->prefill_chunk != tail_plan.impl_->prefill_chunk ||
+        owner_plan.impl_->kv_storage != tail_plan.impl_->kv_storage ||
+        owner_device.device == tail_device.device) {
+        throw std::invalid_argument("TP2 Program requires matching rank-local plans");
+    }
+    auto impl = std::make_unique<detail::ProgramImpl<Variant>>(owner_model, *owner_plan.impl_,
+                                                              owner_device, observer);
+    impl->initialize_tensor(tail_model, *owner_plan.impl_, *tail_plan.impl_, tail_device);
+    owner_plan.impl_.reset();
+    tail_plan.impl_.reset();
     return std::unique_ptr<Program<Variant>>(new Program<Variant>(std::move(impl)));
 }
 

@@ -377,7 +377,8 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
 
             // W's producer-interleaved BF16 layout lets ldmatrix.x2 form the
             // four exact FP32/TF32 A operands. The FP32 state snapshot uses
-            // ldmatrix.x2 as a b16 transport for the two B operand bit patterns.
+            // ldmatrix.x2 as a b16 transport, then explicitly converts its two
+            // FP32 B operands to TF32. The BF16-derived A operands stay exact.
             const int lane_in_8   = lane & 7;
             const int matrix_half = (lane >> 3) & 1;
 #pragma unroll
@@ -390,6 +391,8 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
                 const unsigned b_addr = smem_addr(&snap.at(b_row, b_col));
                 unsigned ub0, ub1;
                 ldmatrix_x2(ub0, ub1, b_addr);
+                ub0 = tf32_operand_bits(__uint_as_float(ub0));
+                ub1 = tf32_operand_bits(__uint_as_float(ub1));
 
 #pragma unroll
                 for (int m_mm1 = 0; m_mm1 < M_TILES_MM1_PW; ++m_mm1) {
@@ -494,7 +497,7 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
                 unpack_bf16x2_to_fp32_bits(packed1, ua1, ua3);
 
                 mma_tf32_bits(h_frag[m][0], h_frag[m][1], h_frag[m][2], h_frag[m][3], ua0, ua1, ua2,
-                              ua3, __float_as_uint(b0), __float_as_uint(b1));
+                              ua3, tf32_operand_bits(b0), tf32_operand_bits(b1));
             }
         }
 

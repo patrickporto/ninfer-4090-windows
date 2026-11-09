@@ -10,6 +10,7 @@ RUN apt-get update \
         libavformat-dev \
         libavutil-dev \
         libcurl4-openssl-dev \
+        libpoppler-glib-dev \
         libswscale-dev \
         ninja-build \
         pkg-config \
@@ -35,6 +36,7 @@ RUN apt-get update \
         libavformat60 \
         libavutil58 \
         libcurl4t64 \
+        libpoppler-glib8 \
         libswscale7 \
     && rm -rf /var/lib/apt/lists/*
 

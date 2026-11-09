@@ -21,7 +21,10 @@ namespace ninfer::ops {
  * All tensors are contiguous BF16. Shapes are x [5120,T], q/gate [6144,T], and k/v [1024,T].
  * T may be any positive value.
  * The two parent weights are RowSplit [7168,5120] with FP16 scales and group size 64:
- * query_key is Q4G64_F16S and gate_value is Q5G64_F16S. The oracle exact-decodes each row and
+ * query_key is Q4G64_F16S and gate_value is Q5G64_F16S. The additional closed TP2 rank-local
+ * profile has both parents RowSplit [3584,5120] (query/gate rows [0,3072), key/value rows
+ * [3072,3584)), q/gate [3072,T] and k/v [512,T]; it admits AllowA8 only, with the same formula
+ * and the unchanged A8 criterion. The oracle exact-decodes each row and
  * evaluates every projection naively in FP64 from the represented inputs. The BF16 outputs are
  * promoted and compared directly with those ideal values; final output storage rounding belongs
  * to AttnInputProj's selected A16 or A8 criterion, not the oracle. A16Only requires no

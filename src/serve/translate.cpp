@@ -311,6 +311,19 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
     options.output.tolerant_tool_calls  = server.tolerant_tool_calls;
+    switch (request.response_format.mode) {
+    case ResponseFormatMode::Text:
+        break;
+    case ResponseFormatMode::JsonObject:
+        options.structured_output.mode = ninfer::StructuredOutputMode::JsonObject;
+        break;
+    case ResponseFormatMode::JsonSchema:
+        options.structured_output.mode        = ninfer::StructuredOutputMode::JsonSchema;
+        options.structured_output.name        = request.response_format.name;
+        options.structured_output.schema_json = request.response_format.schema_json;
+        options.structured_output.strict      = request.response_format.strict;
+        break;
+    }
     options.stop.strings.reserve(request.stop_strings.size() *
                                  (request.stop_strings_apply_to_reasoning ? 2U : 1U));
     for (const std::string& stop : request.stop_strings) {

@@ -5,6 +5,7 @@
 #include "ops/common/act_quant_g64.h"
 #include "ops/common/int8_rowsplit_gemm.cuh"
 
+#include "core/cuda_function_config.h"
 #include "core/device.h"
 #include "ops/common/math.h"
 
@@ -25,13 +26,8 @@ using Q5Narrow = Int8RowSplitGemmSchedule<Int8GemmCodec::Q5, 64, 64, 16, 64, 3, 
 template <class Cfg, bool Full>
 void launch_job(const Int8ProjJob& job, const std::int8_t* xq, const float* xs, std::int32_t tokens,
                 std::int32_t padded_k, cudaStream_t stream) {
-    static const bool configured = [] {
-        CUDA_CHECK(
-            cudaFuncSetAttribute(int8_rowsplit_gemm_kernel<Cfg, Full, Int8GemmEpilogue::Store>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, Cfg::kSharedBytes));
-        return true;
-    }();
-    (void)configured;
+    configure_cuda_shared_memory(int8_rowsplit_gemm_kernel<Cfg, Full, Int8GemmEpilogue::Store>,
+                                 Cfg::kSharedBytes);
 
     const dim3 grid(static_cast<unsigned>(div_up(job.rows, Cfg::kBlockRows)),
                     static_cast<unsigned>(div_up(tokens, Cfg::kBlockCols)));

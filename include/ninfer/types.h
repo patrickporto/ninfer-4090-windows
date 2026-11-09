@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -165,10 +166,28 @@ struct ContextCostOptions {
     std::filesystem::path preset_path;
 };
 
+enum class ParallelMode : std::uint8_t { Single, Pipeline, Tensor };
+
+// Half-open physical decoder layer interval; never a stage-relative layer index.
+struct PhysicalLayerRange {
+    std::uint32_t begin = 0;
+    std::uint32_t end = 0;
+};
+
+struct PlacementOptions {
+    ParallelMode mode = ParallelMode::Single;
+    // Single: empty (EngineOptions::device is authoritative). PP2/TP2: ordered ranks,
+    // exactly two distinct ordinals, with rank zero equal to EngineOptions::device.
+    std::vector<int> devices;
+    // Pipeline only: exactly [0, cut), [cut, 64), in rank order. No inferred cut.
+    std::vector<PhysicalLayerRange> pipeline_layers;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
+    PlacementOptions placement;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
@@ -291,10 +310,28 @@ struct OutputOptions {
     bool tolerant_tool_calls = false;
 };
 
+enum class StructuredOutputMode : std::uint8_t {
+    None,
+    JsonObject,
+    JsonSchema,
+};
+
+// Describes a token-level output language. The target frontend compiles this against its exact
+// tokenizer; the runtime then applies the resulting token mask before every sampling decision.
+struct StructuredOutputOptions {
+    StructuredOutputMode mode = StructuredOutputMode::None;
+    std::string name;
+    std::string schema_json;
+    bool strict = false;
+
+    [[nodiscard]] bool enabled() const noexcept { return mode != StructuredOutputMode::None; }
+};
+
 struct RequestOptions {
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    StructuredOutputOptions structured_output;
 };
 
 enum class MediaKind : std::uint8_t {
@@ -894,7 +931,26 @@ struct VisionWorkspaceMemorySummary {
     std::size_t handoff_peak_bytes        = 0;
 };
 
+// One record per physical device. Capacities are independent and must never be pooled.
+struct PhysicalDeviceMemorySummary {
+    int device = 0;
+    ArenaMemorySummary weights;
+    ArenaMemorySummary sequence;
+    ArenaMemorySummary workspace;
+    ArenaMemorySummary communication;
+    std::uint32_t state_capacity_slots = 0;
+    std::uint32_t state_occupied_slots = 0;
+    std::uint32_t kv_capacity_pages = 0;
+    std::uint32_t kv_occupied_pages = 0;
+    std::size_t runtime_reservation_bytes = 0;
+    std::size_t available_after_weights_bytes = 0;
+    std::size_t available_after_startup_bytes = 0;
+};
+
 struct MemorySummary {
+    std::array<PhysicalDeviceMemorySummary, 2> physical_devices{};
+    std::uint32_t physical_device_count = 1;
+    std::size_t pipeline_host_transfer_capacity_bytes = 0;
     int device                                = 0;
     std::uint32_t max_context                 = 0;
     KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
