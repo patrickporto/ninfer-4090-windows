@@ -106,6 +106,7 @@ jobs:
     container:
       image: nvidia/cuda:13.1.2-devel-ubuntu24.04
     steps:
+      # NCCL is pinned to the release the TP2 qualification ran with (CUDA 13.2 build).
       - name: Install build dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -114,7 +115,8 @@ jobs:
           apt-get install --yes --no-install-recommends \
             git ca-certificates cmake ninja-build pkg-config patchelf \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-            libcurl4-openssl-dev libpoppler-glib-dev libnccl-dev
+            libcurl4-openssl-dev libpoppler-glib-dev \
+            libnccl2=2.29.7-1+cuda13.2 libnccl-dev=2.29.7-1+cuda13.2
 
       - uses: actions/checkout@v4
 
