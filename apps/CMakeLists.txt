@@ -30,7 +30,10 @@ target_include_directories(ninfer-perplexity PRIVATE
 target_link_libraries(ninfer-perplexity PRIVATE ninfer_engine ninfer_product_logging)
 
 # CUDA API only: this probe does not require inference kernels for each queried SM.
-add_executable(ninfer_parallel_topology_probe ../tools/parallel_topology_probe.cpp)
-target_include_directories(ninfer_parallel_topology_probe PRIVATE
-  ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
-target_link_libraries(ninfer_parallel_topology_probe PRIVATE ninfer_core)
+# Linux only: it reads PCIe topology from sysfs.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(ninfer_parallel_topology_probe ../tools/parallel_topology_probe.cpp)
+  target_include_directories(ninfer_parallel_topology_probe PRIVATE
+    ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party)
+  target_link_libraries(ninfer_parallel_topology_probe PRIVATE ninfer_core)
+endif()

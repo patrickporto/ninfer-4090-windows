@@ -584,10 +584,12 @@ endforeach()
 
 
 # PDF extraction/rendering is CPU-only and does not require model weights or CUDA execution.
-ninfer_add_test(ninfer_pdf_document_test
-  SOURCES test_pdf_document.cpp
-  LIBRARIES ninfer_pdf_document)
+if(NINFER_ENABLE_PDF)
+  ninfer_add_test(ninfer_pdf_document_test
+    SOURCES test_pdf_document.cpp
+    LIBRARIES ninfer_pdf_document)
 
-ninfer_add_test(ninfer_pdf_input_test
-  SOURCES test_pdf_input.cpp
-  LIBRARIES ninfer_serve)
+  ninfer_add_test(ninfer_pdf_input_test
+    SOURCES test_pdf_input.cpp
+    LIBRARIES ninfer_serve)
+endif()

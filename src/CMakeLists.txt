@@ -417,11 +417,15 @@ target_link_libraries(ninfer_engine
 add_library(ninfer::engine ALIAS ninfer_engine)
 
 if(NINFER_BUILD_SERVE)
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(POPPLER REQUIRED IMPORTED_TARGET poppler-glib>=0.82)
-  add_library(ninfer_pdf_document STATIC product/document/pdf.cpp)
+  if(NINFER_ENABLE_PDF)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(POPPLER REQUIRED IMPORTED_TARGET poppler-glib>=0.82)
+    add_library(ninfer_pdf_document STATIC product/document/pdf.cpp)
+    target_link_libraries(ninfer_pdf_document PUBLIC PkgConfig::POPPLER)
+  else()
+    add_library(ninfer_pdf_document STATIC product/document/pdf_unavailable.cpp)
+  endif()
   ninfer_internal_includes(ninfer_pdf_document)
-  target_link_libraries(ninfer_pdf_document PUBLIC PkgConfig::POPPLER)
   # HTTP protocol/product adapter. No serving header is part of the public API.
   add_library(ninfer_serve STATIC
     serve/http_transport.cpp
