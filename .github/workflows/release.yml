@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: echo "tag=v$(tr -d '[:space:]' < VERSION)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+  windows:
+    needs: version
+    runs-on: windows-2022
+    timeout-minutes: 300
+    env:
+      VCPKG_COMMIT: 4bca8fd8654e5ba76f92661db7bfe954768ad8ef
+      # The runner image ships its own C:\vcpkg; use a separate pinned checkout.
+      VCPKG_ROOT: D:\vcpkg-pinned
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-cache,readwrite
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "13.1.1"
+          method: network
+
+      - name: Cache vcpkg binary archives
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-
+
+      - name: Setup vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force -Path vcpkg-cache | Out-Null
+          git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          git -C $env:VCPKG_ROOT checkout $env:VCPKG_COMMIT
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # sm_89 (RTX 4090) and sm_120 (RTX 50xx). NCCL is Linux-only, so Windows builds have
+      # Single and Pipeline placement but no Tensor placement; PDF input needs poppler (off).
+      - name: Configure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake -S . -B build-windows -G Ninja `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=cl `
+            -DCMAKE_CXX_COMPILER=cl `
+            "-DCMAKE_CUDA_ARCHITECTURES=89-real;120a-real" `
+            -DNINFER_BUILD_BENCHMARKS=ON `
+            -DNINFER_ENABLE_PDF=OFF
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake --build build-windows --parallel
+
+      - name: Package
+        shell: pwsh
+        run: scripts\package-release.ps1 -ReleaseTag ${{ needs.version.outputs.tag }} -BuildRoot build-windows
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+
+  linux:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    container:
+      image: nvidia/cuda:13.1.2-devel-ubuntu24.04
+    steps:
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            git ca-certificates cmake ninja-build pkg-config patchelf \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            libcurl4-openssl-dev libpoppler-glib-dev libnccl-dev
+
+      - uses: actions/checkout@v4
+
+      # sm_89 + sm_120, NCCL tensor parallelism and PDF input enabled.
+      - name: Configure
+        run: |
+          cmake -S . -B build-linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            "-DCMAKE_CUDA_ARCHITECTURES=89-real;120a-real" \
+            -DNINFER_BUILD_BENCHMARKS=ON \
+            -DNINFER_ENABLE_NCCL=ON \
+            -DNINFER_NCCL_ROOT=/usr \
+            -DNINFER_ENABLE_PDF=ON
+
+      - name: Build
+        run: cmake --build build-linux --parallel "$(nproc)"
+
+      - name: Package
+        run: bash scripts/package-release.sh "${{ needs.version.outputs.tag }}" build-linux linux-x64-ubuntu24.04
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+
+  release:
+    needs: [version, windows, linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: NInfer ${{ needs.version.outputs.tag }} (Windows x64 + Linux x64, sm_89/sm_120)
+          prerelease: true
+          generate_release_notes: true
+          files: dist/*

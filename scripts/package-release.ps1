@@ -18,9 +18,13 @@ $ProductRoot = Join-Path $DistRoot $ProductName
 $ArchivePath = Join-Path $DistRoot "$ProductName.zip"
 $ChecksumPath = Join-Path $DistRoot "SHA256SUMS-$ReleaseTag.txt"
 
+# Every executable embeds the full sm_89+sm_120 kernel library, so benchmarks and perplexity ship
+# in a separate -tools archive to stay under GitHub's 2 GiB per-asset limit.
 $Products = @(
     @{ Source = 'apps\ninfer.exe'; Destination = 'ninfer.exe' },
-    @{ Source = 'apps\ninfer-serve.exe'; Destination = 'ninfer-serve.exe' },
+    @{ Source = 'apps\ninfer-serve.exe'; Destination = 'ninfer-serve.exe' }
+)
+$ToolProducts = @(
     @{ Source = 'apps\ninfer-perplexity.exe'; Destination = 'ninfer-perplexity.exe' },
     @{ Source = 'bench\ninfer_bench.exe'; Destination = 'ninfer_bench.exe' }
 )
@@ -63,9 +67,32 @@ $innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File | Sort-Object Name 
 }
 $innerHashes | Set-Content -LiteralPath (Join-Path $ProductRoot 'SHA256SUMS.txt') -Encoding ascii
 Compress-Archive -LiteralPath $ProductRoot -DestinationPath $ArchivePath -CompressionLevel Optimal
-$archiveHash = Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256
-"$($archiveHash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $ArchivePath)" |
-    Set-Content -LiteralPath $ChecksumPath -Encoding ascii
 
-Get-Item -LiteralPath $ArchivePath, $ChecksumPath |
+# The archive's top folder has the runtime bundle's name, so both extract into one folder.
+$ToolsName = "$ProductName-tools"
+$ToolsStage = Join-Path $DistRoot '.tools-stage'
+$ToolsRoot = Join-Path $ToolsStage $ProductName
+$ToolsArchive = Join-Path $DistRoot "$ToolsName.zip"
+if (Test-Path -LiteralPath $ToolsStage) { Remove-Item -LiteralPath $ToolsStage -Recurse -Force }
+if (Test-Path -LiteralPath $ToolsArchive) { Remove-Item -LiteralPath $ToolsArchive -Force }
+New-Item -ItemType Directory -Path $ToolsRoot -Force | Out-Null
+foreach ($product in $ToolProducts) {
+    $source = Join-Path $BuildRoot $product.Source
+    if (-not (Test-Path -LiteralPath $source)) { throw "Missing release product: $source" }
+    Copy-Item -LiteralPath $source -Destination (Join-Path $ToolsRoot $product.Destination)
+}
+Get-ChildItem -LiteralPath $ToolsRoot -File | Sort-Object Name | ForEach-Object {
+    $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
+    "$($hash.Hash.ToLowerInvariant())  $($_.Name)"
+} | Set-Content -LiteralPath (Join-Path $ToolsRoot 'SHA256SUMS-tools.txt') -Encoding ascii
+Compress-Archive -LiteralPath $ToolsRoot -DestinationPath $ToolsArchive -CompressionLevel Optimal
+Remove-Item -LiteralPath $ToolsStage -Recurse -Force
+
+$checksums = foreach ($archive in @($ArchivePath, $ToolsArchive)) {
+    $hash = Get-FileHash -LiteralPath $archive -Algorithm SHA256
+    "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $archive)"
+}
+$checksums | Set-Content -LiteralPath $ChecksumPath -Encoding ascii
+
+Get-Item -LiteralPath $ArchivePath, $ToolsArchive, $ChecksumPath |
     Select-Object Name, @{ Name = 'SizeMB'; Expression = { [math]::Round($_.Length / 1MB, 2) } }
