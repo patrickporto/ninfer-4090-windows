@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
             launch(tokens, stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             const auto plan = ops::detail::q5_linear_add_resolve_plan(
-                {kRows, options.hidden, options.hidden, tokens});
+                {kRows, options.hidden, options.hidden, tokens}, ops::LinearPolicy::A16Only);
             std::printf("profile K=%d T=%d route=%s workspace=%zu\n", options.hidden, tokens,
                         ops::detail::q5_linear_add_schedule_name(plan.schedule),
                         workspace_capacity);
@@ -146,7 +146,7 @@ int main(int argc, char** argv) {
                             bytes / seconds / 1.0e9, flops / seconds / 1.0e12);
             };
             const auto plan = ops::detail::q5_linear_add_resolve_plan(
-                {kRows, options.hidden, options.hidden, tokens});
+                {kRows, options.hidden, options.hidden, tokens}, ops::LinearPolicy::A16Only);
             measure(ops::detail::q5_linear_add_schedule_name(plan.schedule),
                     [&](cudaStream_t launch_stream) { launch(tokens, launch_stream); });
         }
