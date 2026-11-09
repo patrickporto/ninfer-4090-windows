@@ -1,4 +1,5 @@
 #pragma once
+#include "targets/qwen3_6/impl/runtime/pipeline_schedule.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
@@ -158,7 +159,8 @@ public:
                 std::uint32_t text_kv_base,
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
-                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr);
+                const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr,
+                std::optional<PhysicalLayerRange> pipeline_layers = std::nullopt);
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -209,6 +211,20 @@ public:
                                                    std::uint32_t nominal_length,
                                                    VisionPrefillSession& vision,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
+    // Pipeline leaves operate on stable caller-owned residuals. All metadata and state views
+    // must belong to ctx_'s device; the coordinator transfers hidden values, never these views.
+    void pipeline_embedding(const Tensor& ids, Tensor& residual);
+    void pipeline_prefill_stage(Tensor& residual, const Tensor& cache_positions,
+                                const Tensor& rope_positions, const Tensor& kv_table_row,
+                                ops::CausalAttentionExecutionEnvelope envelope);
+    void pipeline_decode_stage(Tensor& residual, const Tensor& cache_positions,
+                               const Tensor& rope_positions, const Tensor& kv_table_rows,
+                               const Tensor& linear_state_source_slots,
+                               const Tensor& linear_state_destination_slots,
+                               ops::CausalAttentionExecutionEnvelope envelope);
+    void pipeline_final_norm(const Tensor& residual, Tensor& hidden);
+    void pipeline_head(const Tensor& hidden, Tensor& logits);
+
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& linear_state_source_slots,
@@ -295,6 +311,8 @@ private:
     [[nodiscard]] PrefillChunkResult
     prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
                  const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
+    const runtime_support::StageLayerLayout stage_layers_;
+    const bool pipeline_stage_;
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;

@@ -27,6 +27,7 @@ public:
     DeviceBuffer(DeviceBuffer&& other) noexcept;
     DeviceBuffer& operator=(DeviceBuffer&& other) noexcept;
 
+    [[nodiscard]] int device() const noexcept { return device_; }
     void fill(int byte_value = 0);
     // Completes the upload before returning. Callers must first order any prior device
     // accesses to the destination range.
@@ -38,6 +39,7 @@ public:
     std::size_t bytes = 0;
 
 private:
+    int device_ = 0;
     void require_range(std::size_t byte_offset, std::size_t count, const char* operation) const;
 };
 
@@ -76,6 +78,7 @@ public:
     [[nodiscard]] Scope scope() noexcept;
     void reset() noexcept;
 
+    [[nodiscard]] int device() const noexcept { return device_; }
     void* base() const noexcept;
     std::size_t used() const noexcept;
     std::size_t capacity() const noexcept;
@@ -83,6 +86,7 @@ public:
     void reset_peak() noexcept;
 
 private:
+    int device_ = 0;
     void* base_       = nullptr;
     std::size_t cap_  = 0;
     std::size_t off_  = 0;

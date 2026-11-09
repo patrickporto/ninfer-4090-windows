@@ -483,8 +483,10 @@ int test_messages_and_media() {
                       "input audio rejected");
     body["messages"][0]["content"] =
         Json::array({Json{{"type", "file"}, {"file", Json::object()}}});
-    failures += check(api_error([&] { (void)parse(body); }).code == "modality_not_supported",
-                      "file input rejected");
+    const auto missing_pdf_source = api_error([&] { (void)parse(body); });
+    failures += check(missing_pdf_source.status == 400 &&
+                          missing_pdf_source.message.find("file_data") != std::string::npos,
+                      "PDF file without a source rejected");
 
     body                        = base_request();
     body["messages"][0]["name"] = "speaker";

@@ -19,7 +19,10 @@ English reference text, English long-form text, Chinese reference text, and NInf
 
 The default evaluation uses a 4,096-token context and a 2,048-token stride. Use `--context` and
 `--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. The available Main
-KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`.
+KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `rk8v4`, `rk4v4`, `rk4v4-e8`, and
+`rk2v4-e8`. The rotated and E8 representations use the same existing KV allocation and attention
+paths as generation; causal scoring retains the selected format while disabling generation-only
+features. Their availability still depends on the selected artifact and GPU's existing Op support.
 
 ```bash
 ./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
@@ -69,3 +72,19 @@ The corpus name is a workload scale, not an exact token count. Exact input and s
 are runtime results from the current artifact tokenizer and are recorded in each report. Reports
 contain unrounded NLL/PPL values for every window, stream, domain, and the token-weighted overall
 aggregate.
+
+Add `--token-nll tokens.jsonl` to export one JSON object per scored token for paired numerical
+comparisons. Each line contains `stream_id` (the corpus stream ID or custom text filename), `target_index`
+(the zero-based absolute token position within that stream), and `nll` (negative natural-log
+probability, preserving the scorer's FP32 precision). Token zero is excluded; overlapping windows
+never duplicate targets. For example:
+
+```json
+{"nll":1.25,"stream_id":"notes.txt","target_index":1}
+```
+
+The file is overwritten, and its parent directory must exist. Input files and reserved
+`report.json`/`report.json.tmp` destinations are rejected, including symlink and hardlink aliases.
+A failed run may leave partial
+output; only compare completed runs. Match rows by stream ID and target index and keep tokenization,
+context, and stride fixed. Writing this optional export adds file I/O to the reported scoring time.

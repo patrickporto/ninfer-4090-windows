@@ -60,11 +60,12 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
 enum class Int8GemmCodec { Q4, Q5 };
-enum class Int8GemmEpilogue { Store, AddResidual };
+enum class Int8GemmEpilogue { Store, AddResidual, StoreFp32 };
 
 // Both codecs share the group extent, code plane width, and scale width; they
 // differ only in whether a high-bit plane exists.
@@ -151,7 +152,7 @@ void int8_rowsplit_gemm_kernel(
     const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high,
     const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ out,
+    std::conditional_t<Epilogue == Int8GemmEpilogue::StoreFp32, float, __nv_bfloat16>* __restrict__ out,
     std::int32_t rows,
     std::int32_t cols,
     std::int32_t padded_k,
@@ -441,7 +442,9 @@ void int8_rowsplit_gemm_kernel(
     // stages the projection through BF16 first.
     auto emit = [&](int col, int row, float value) {
         const std::int64_t index = static_cast<std::int64_t>(col) * out_row_stride + row;
-        if constexpr (Epilogue == Int8GemmEpilogue::AddResidual) {
+        if constexpr (Epilogue == Int8GemmEpilogue::StoreFp32) {
+            out[index] = value;
+        } else if constexpr (Epilogue == Int8GemmEpilogue::AddResidual) {
             out[index] = __float2bfloat16_rn(__bfloat162float(out[index]) + value);
         } else {
             out[index] = __float2bfloat16_rn(value);

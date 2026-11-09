@@ -28,7 +28,15 @@ struct CaptureAssessmentImpl;
 } // namespace detail
 
 // Read-only diagnostics sampled from the real Program stores.  This is not an accounting input.
+struct PhysicalRankUsage {
+    int device = 0;
+    std::uint32_t state_slots = 0;
+    std::uint32_t main_kv_pages = 0;
+    [[nodiscard]] friend constexpr bool operator==(const PhysicalRankUsage&, const PhysicalRankUsage&) noexcept = default;
+};
 struct PhysicalUsageSnapshot {
+    std::array<PhysicalRankUsage, 2> ranks{};
+    std::uint32_t rank_count = 1;
     runtime::ProgramResourceRevision resource_revision;
     std::uint32_t device_state_slots      = 0;
     std::uint32_t host_state_slots        = 0;
@@ -209,7 +217,8 @@ public:
 
     template <class V>
     friend SequencePlanner<V> make_sequence_planner(DeviceContext&, const EngineOptions&,
-                                                    typename V::WeightsProfile);
+                                                    typename V::WeightsProfile,
+                                                    std::optional<PhysicalLayerRange>);
 };
 
 template <class Variant>
@@ -1032,6 +1041,7 @@ public:
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    [[nodiscard]] bool execution_failed() const noexcept;
     void reset_memory_peaks() noexcept;
 
 private:
@@ -1042,6 +1052,14 @@ private:
     friend std::unique_ptr<Program<V>> create_program(const typename V::ModelView&,
                                                       typename V::WeightsProfile, SequencePlan<V>&&,
                                                       DeviceContext&, const StartupObserver&);
+    template <class V>
+    friend std::unique_ptr<Program<V>> create_pipeline_program(
+        const typename V::ModelView&, const typename V::ModelView&, typename V::WeightsProfile,
+        SequencePlan<V>&&, SequencePlan<V>&&, DeviceContext&, DeviceContext&, const StartupObserver&);
+    template <class V>
+    friend std::unique_ptr<Program<V>> create_tensor_program(
+        const typename V::ModelView&, const typename V::ModelView&, typename V::WeightsProfile,
+        SequencePlan<V>&&, SequencePlan<V>&&, DeviceContext&, DeviceContext&, const StartupObserver&);
 };
 
 namespace detail {
@@ -1200,12 +1218,29 @@ struct RuntimeContractAccess {
 template <class Variant>
 [[nodiscard]] SequencePlanner<Variant>
 make_sequence_planner(DeviceContext& device, const EngineOptions& options,
-                      typename Variant::WeightsProfile weights_profile);
+                      typename Variant::WeightsProfile weights_profile,
+                      std::optional<PhysicalLayerRange> pipeline_layers = std::nullopt,
+                      std::optional<std::uint32_t> tensor_rank = std::nullopt);
 
 template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
 create_program(const typename Variant::ModelView& model,
                typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& plan,
                DeviceContext& device, const StartupObserver& startup_observer);
+
+template <class Variant>
+[[nodiscard]] std::unique_ptr<Program<Variant>> create_pipeline_program(
+    const typename Variant::ModelView& owner_model, const typename Variant::ModelView& tail_model,
+    typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& owner_plan,
+    SequencePlan<Variant>&& tail_plan, DeviceContext& owner_device, DeviceContext& tail_device,
+    const StartupObserver& observer);
+
+// TP2: rank-0 (owner endpoints + local shards) and rank-1 local-shard models with matching plans.
+template <class Variant>
+[[nodiscard]] std::unique_ptr<Program<Variant>> create_tensor_program(
+    const typename Variant::ModelView& owner_model, const typename Variant::ModelView& tail_model,
+    typename Variant::WeightsProfile weights_profile, SequencePlan<Variant>&& owner_plan,
+    SequencePlan<Variant>&& tail_plan, DeviceContext& owner_device, DeviceContext& tail_device,
+    const StartupObserver& observer);
 
 } // namespace ninfer::targets::qwen3_6

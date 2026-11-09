@@ -1018,12 +1018,19 @@ public:
             if (grammar_compiler == nullptr || grammar_vocab <= 0) {
                 throw std::logic_error("structured output requires a grammar compiler");
             }
-            xgrammar::CompiledGrammar grammar =
-                structured.mode == StructuredOutputMode::JsonObject
-                    ? grammar_compiler->CompileBuiltinJSONGrammar()
-                    : grammar_compiler->CompileJSONSchema(structured.schema_json, true,
-                                                          std::nullopt, std::nullopt,
-                                                          structured.strict);
+            xgrammar::CompiledGrammar grammar = [&] {
+                if (structured.mode == StructuredOutputMode::JsonObject) {
+                    return grammar_compiler->CompileBuiltinJSONGrammar();
+                }
+                try {
+                    return grammar_compiler->CompileJSONSchema(structured.schema_json, true,
+                                                               std::nullopt, std::nullopt,
+                                                               structured.strict);
+                } catch (const std::runtime_error&) {
+                    throw std::invalid_argument(
+                        "JSON Schema is invalid or contains unsupported constructs");
+                }
+            }();
             std::vector<int> stops(policy.token_ids.begin(), policy.token_ids.end());
             matcher.emplace(grammar, std::move(stops), false, -1);
             mask.resize(static_cast<std::size_t>(xgrammar::GetBitmaskSize(grammar_vocab)));

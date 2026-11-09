@@ -1,3 +1,4 @@
+#include "serve/document_input.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
 #include "serve/request_validation.h"
@@ -327,6 +328,13 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
             }
             parsed.kind   = ContentKind::Image;
             parsed.source = parse_media_url(part, "image_url", true);
+        } else if (type == "file") {
+            if (turn.role != ChatRole::User && turn.role != ChatRole::Tool) {
+                bad_request("PDF files are only supported on user or tool messages", "messages");
+            }
+            if (!part.contains("file")) { bad_request("file content requires a file object", "messages"); }
+            parsed.kind = ContentKind::Document;
+            parsed.source = parse_pdf_source(part.at("file"), "messages");
         } else if (type == "video_url") {
             // Qwen, vLLM, and SGLang use video_url as a Chat Completions extension for
             // multimodal models. NInfer maps it to the Engine's native Video input.

@@ -173,7 +173,7 @@ The endpoint supports:
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes nonzero `logit_bias`, requested log probabilities,
-audio/file input or audio output, `strict:true`, required or named tool choice,
+audio/non-PDF file input or audio output, `strict:true`, required or named tool choice,
 `parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
 moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
@@ -529,7 +529,7 @@ An `input_text`, `input_image`, or tool-result part may carry
 identity or output semantics. String message status/phase metadata is accepted but has no Qwen
 prompt representation.
 
-`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning metadata without raw
+`input_audio`, image `file_id`, non-`auto` image detail, reasoning metadata without raw
 reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
 stored in a response chain are fetched again when that chain is continued; use data URIs when the
 historical media bytes must be immutable.
@@ -775,7 +775,7 @@ emits `message_start` after Engine admission commits the prefix selection and be
 transfer/prefill output, so its uncached/cache-read split is already exact; terminal cumulative
 usage matches the aggregate response.
 
-Documents, Search Results, Files, Structured Outputs, server-tool results, container uploads, and
+Search Results, stored Files, server-tool results, container uploads, and
 other execution-dependent blocks are rejected with the missing capability identified. Metadata,
 service tier, inference geography, protocol-version/beta headers, cache TTL, and unknown advisory
 fields do not block an otherwise executable request. The request `model` is any non-empty local
@@ -1071,3 +1071,24 @@ decoding.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.
+
+## PDF document input
+
+PDFs are decoded in memory with Poppler, before tokenization, using the same acquisition,
+remote-URL policy, request deadline, cancellation and aggregate media-byte budget as images.
+Install the Poppler GLib development package when building natively (`poppler-glib` pkg-config).
+The Docker image includes the build and runtime dependencies.
+
+- Chat Completions: user/tool content part `{"type":"file","file":{"filename":"report.pdf","file_data":"data:application/pdf;base64,..."}}`.
+- Responses: user message content part `{"type":"input_file","filename":"report.pdf","file_data":"data:application/pdf;base64,..."}`. Function-call output content also accepts this part.
+- Anthropic Messages: user `document` block with `source:{"type":"base64","media_type":"application/pdf","data":"..."}`.
+- OpenAI file parts also accept raw base64 `file_data` or an HTTP(S) `file_url` instead. Anthropic supports `source:{"type":"url","url":"https://..."}`.
+
+Text is extracted page by page. With `--vision`, pages are additionally rendered to PNG at
+1280 pixels on the longest side and passed through the existing image path, allowing scanned
+pages and visual layouts to be read. Without Vision, pages with no extractable text are rejected
+explicitly. Rendered images remain subject to the Engine's image/token limits.
+
+Each PDF is limited to 32 MiB; all PDFs in one request share a 64-page and 16 MiB extracted/rendered
+output budget. Encrypted PDFs must be unlocked by the client before upload. Persistent `file_id`,
+PDF citations and password fields are not implemented. PDF bytes are not written to temporary files.

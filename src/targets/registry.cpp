@@ -4,6 +4,8 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "core/device_group.h"
+#include "targets/qwen3_6_27b/impl/parallel_plan.h"
 #include "core/startup.h"
 #include "runtime/engine/kv_capacity.h"
 #include "runtime/engine/context_cost.h"
@@ -156,6 +158,172 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                              .context_cost      = std::move(context_cost.model)};
 }
 
+ConstructedTarget construct_pipeline(const EngineOptions& options, DeviceGroup& group,
+                                     artifact::Reader& reader, Clock::time_point load_start) {
+    using Target = Qwen3_6_27B;
+    const auto& identity = reader.identity();
+    const auto placement = qwen3_6_27b::detail::ParallelPlan::create(options, identity.model_id, identity.weights_id);
+    if (placement.mode() != ParallelMode::Pipeline || group.size() != 2)
+        throw std::invalid_argument("pipeline registry requires two physical ranks");
+    const auto profile = Target::resolve_weights(identity);
+    artifact::Binder binder(reader);
+    auto loads = Target::plan_pipeline_load(binder, options, profile);
+    auto make_planner = [&](unsigned rank) {
+        ScopedDevice bind(group.context(rank).device);
+        return Target::make_sequence_planner(group.context(rank), options, profile,
+                                            placement.ranks()[rank].layers);
+    };
+    std::array<Target::SequencePlanner, 2> planners{make_planner(0), make_planner(1)};
+    std::array<runtime::SequenceCapacityCurve, 2> curves{
+        planners[0].capacity_curve(), planners[1].capacity_curve()};
+    // Both complete physical budgets must fit before either rank uploads a byte.
+    for (unsigned rank = 0; rank < 2; ++rank) {
+        ScopedDevice bind(group.context(rank).device);
+        (void)runtime::resolve_kv_capacity(options.kv_capacity, curves[rank],
+            runtime_bytes_after_planned_weights(loads[rank].materialization().device_capacity_bytes));
+    }
+    std::array<std::unique_ptr<Target::LoadedModel>, 2> models;
+    std::array<artifact::MaterializationStats, 2> stats;
+    std::array<runtime::KvCapacityResolution, 2> resolutions;
+    for (unsigned rank = 0; rank < 2; ++rank) {
+        ScopedDevice bind(group.context(rank).device);
+        auto materialized = artifact::materialize(reader, loads[rank].materialization(),
+                                                  group.context(rank), &options.startup_observer);
+        stats[rank] = materialized.stats();
+        models[rank] = Target::construct_loaded_model(std::move(loads[rank]), std::move(materialized));
+        group.context(rank).synchronize();
+        resolutions[rank] = runtime::resolve_kv_capacity(options.kv_capacity, curves[rank], current_free_device_bytes());
+    }
+    const auto pages = std::min(resolutions[0].main_page_groups, resolutions[1].main_page_groups);
+    for (unsigned rank = 0; rank < 2; ++rank) {
+        auto& resolution = resolutions[rank];
+        resolution.main_page_groups = pages;
+        resolution.resolved_tokens = curves[rank].resolved_tokens(pages);
+        resolution.runtime_reservation_bytes = curves[rank].reservation_bytes(pages);
+        resolution.planned_slack_bytes = resolution.available_after_weights_bytes -
+            resolution.runtime_reservation_bytes;
+    }
+    auto owner_plan = std::move(planners[0]).finalize(pages);
+    auto tail_plan = std::move(planners[1]).finalize(pages);
+    ScopedDevice bind(group.context(0).device);
+    const runtime::ContextCostIdentity cost_identity{
+        .hardware_class = runtime::context_cost_hardware_class(group.context(0).props.name,
+            group.context(0).props.major, group.context(0).props.minor),
+        .model_id = identity.model_id, .weights_id = identity.weights_id};
+    auto cost = runtime::resolve_context_machine_cost(cost_identity, options.context_cost.preset_path);
+    auto loaded = std::make_unique<LoadedQwen3_6_27B>(std::move(models[0]), options);
+    auto instance = std::make_unique<Qwen3_6_27BInstance>(std::move(loaded), std::move(models[1]),
+        resolutions, std::move(owner_plan), std::move(tail_plan), group.context(0), group.context(1),
+        options.startup_observer);
+    group.synchronize();
+    for (unsigned rank = 0; rank < 2; ++rank) {
+        ScopedDevice bind_rank(group.context(rank).device);
+        instance->pipeline_capacity[rank].available_after_startup_bytes = current_free_device_bytes();
+    }
+    instance->kv_capacity_resolution = instance->pipeline_capacity[0];
+    LoadSummary summary;
+    summary.target = std::string(Target::qwen3_8_target_key);
+    summary.model_id = identity.model_id;
+    summary.weights_id = identity.weights_id;
+    summary.load_seconds = std::chrono::duration<double>(Clock::now() - load_start).count();
+    summary.context_cost = cost.summary;
+    for (const auto& stat : stats) {
+        summary.upload_seconds += stat.upload_seconds;
+        summary.artifact_bytes_read += stat.file_bytes;
+        summary.host_to_device_bytes += stat.h2d_bytes;
+        summary.peak_staging_bytes = std::max(summary.peak_staging_bytes, stat.peak_staging_bytes);
+        summary.tensor_count += stat.tensor_count;
+        summary.resource_count += stat.resource_count;
+    }
+    return {.active = ActiveTarget(std::move(instance)), .load = std::move(summary),
+        .sampling_defaults = Target::sampling_defaults(identity.model_id), .context_cost = std::move(cost.model)};
+}
+
+// TP2: one strict whole-file binding, two rank-local materializations, and per-device budgets.
+// Every rank holds all 64 layers at local head geometry; rank 0 adds the owner endpoints.
+ConstructedTarget construct_tensor(const EngineOptions& options, DeviceGroup& group,
+                                   artifact::Reader& reader, Clock::time_point load_start) {
+    using Target = Qwen3_6_27B;
+    const auto& identity = reader.identity();
+    const auto placement = qwen3_6_27b::detail::ParallelPlan::create(options, identity.model_id, identity.weights_id);
+    if (placement.mode() != ParallelMode::Tensor || group.size() != 2)
+        throw std::invalid_argument("TP2 registry requires two physical ranks");
+    if (identity.model_id != Target::qwen3_8_model_id || identity.weights_id != "groupwise-int-tp2")
+        throw std::invalid_argument("TP2 requires the qwen3.8-27b/groupwise-int-tp2 artifact");
+    const auto profile = Target::WeightsProfile::Qwen38GroupwiseInt;
+    auto loads = Target::plan_tensor_load(reader, options);
+    auto make_planner = [&](unsigned rank) {
+        ScopedDevice bind(group.context(rank).device);
+        return Target::make_sequence_planner(group.context(rank), options, profile, std::nullopt,
+                                            rank);
+    };
+    std::array<Target::SequencePlanner, 2> planners{make_planner(0), make_planner(1)};
+    std::array<runtime::SequenceCapacityCurve, 2> curves{
+        planners[0].capacity_curve(), planners[1].capacity_curve()};
+    // Memory feasibility is a per-device vector inequality, checked before either rank uploads.
+    for (unsigned rank = 0; rank < 2; ++rank) {
+        ScopedDevice bind(group.context(rank).device);
+        (void)runtime::resolve_kv_capacity(options.kv_capacity, curves[rank],
+            runtime_bytes_after_planned_weights(loads[rank].materialization().device_capacity_bytes));
+    }
+    std::array<std::unique_ptr<Target::LoadedModel>, 2> models;
+    std::array<artifact::MaterializationStats, 2> stats;
+    std::array<runtime::KvCapacityResolution, 2> resolutions;
+    for (unsigned rank = 0; rank < 2; ++rank) {
+        ScopedDevice bind(group.context(rank).device);
+        auto materialized = artifact::materialize(reader, loads[rank].materialization(),
+                                                  group.context(rank), &options.startup_observer);
+        stats[rank] = materialized.stats();
+        models[rank] = Target::construct_loaded_model(std::move(loads[rank]), std::move(materialized));
+        group.context(rank).synchronize();
+        resolutions[rank] = runtime::resolve_kv_capacity(options.kv_capacity, curves[rank], current_free_device_bytes());
+    }
+    // One request's context ceiling is the minimum feasible frontier over both ranks.
+    const auto pages = std::min(resolutions[0].main_page_groups, resolutions[1].main_page_groups);
+    for (unsigned rank = 0; rank < 2; ++rank) {
+        auto& resolution = resolutions[rank];
+        resolution.main_page_groups = pages;
+        resolution.resolved_tokens = curves[rank].resolved_tokens(pages);
+        resolution.runtime_reservation_bytes = curves[rank].reservation_bytes(pages);
+        resolution.planned_slack_bytes = resolution.available_after_weights_bytes -
+            resolution.runtime_reservation_bytes;
+    }
+    auto owner_plan = std::move(planners[0]).finalize(pages);
+    auto tail_plan = std::move(planners[1]).finalize(pages);
+    ScopedDevice bind(group.context(0).device);
+    const runtime::ContextCostIdentity cost_identity{
+        .hardware_class = runtime::context_cost_hardware_class(group.context(0).props.name,
+            group.context(0).props.major, group.context(0).props.minor),
+        .model_id = identity.model_id, .weights_id = identity.weights_id};
+    auto cost = runtime::resolve_context_machine_cost(cost_identity, options.context_cost.preset_path);
+    auto loaded = std::make_unique<LoadedQwen3_6_27B>(std::move(models[0]), options);
+    auto instance = std::make_unique<Qwen3_6_27BInstance>(std::move(loaded), std::move(models[1]),
+        resolutions, std::move(owner_plan), std::move(tail_plan), group.context(0), group.context(1),
+        options.startup_observer, ParallelMode::Tensor);
+    group.synchronize();
+    for (unsigned rank = 0; rank < 2; ++rank) {
+        ScopedDevice bind_rank(group.context(rank).device);
+        instance->pipeline_capacity[rank].available_after_startup_bytes = current_free_device_bytes();
+    }
+    instance->kv_capacity_resolution = instance->pipeline_capacity[0];
+    LoadSummary summary;
+    summary.target = std::string(Target::qwen3_8_target_key);
+    summary.model_id = identity.model_id;
+    summary.weights_id = identity.weights_id;
+    summary.load_seconds = std::chrono::duration<double>(Clock::now() - load_start).count();
+    summary.context_cost = cost.summary;
+    for (const auto& stat : stats) {
+        summary.upload_seconds += stat.upload_seconds;
+        summary.artifact_bytes_read += stat.file_bytes;
+        summary.host_to_device_bytes += stat.h2d_bytes;
+        summary.peak_staging_bytes = std::max(summary.peak_staging_bytes, stat.peak_staging_bytes);
+        summary.tensor_count += stat.tensor_count;
+        summary.resource_count += stat.resource_count;
+    }
+    return {.active = ActiveTarget(std::move(instance)), .load = std::move(summary),
+        .sampling_defaults = Target::sampling_defaults(identity.model_id), .context_cost = std::move(cost.model)};
+}
+
 } // namespace
 
 LoadedQwen3_6_27B::LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model,
@@ -173,6 +341,20 @@ Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stab
       capacity(sequence_plan.capacity()),
       program(Qwen3_6_27B::create_program(*loaded->model, std::move(sequence_plan), device,
                                           startup_observer)) {}
+
+Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stable_loaded,
+    std::unique_ptr<Qwen3_6_27B::LoadedModel> tail_model,
+    std::array<runtime::KvCapacityResolution, 2> resolutions,
+    Qwen3_6_27B::SequencePlan owner_plan, Qwen3_6_27B::SequencePlan tail_plan,
+    DeviceContext& owner_device, DeviceContext& tail_device, const StartupObserver& observer,
+    ParallelMode mode)
+    : loaded(std::move(stable_loaded)), pipeline_model(std::move(tail_model)),
+      pipeline_capacity(resolutions), kv_capacity_resolution(resolutions[0]), capacity(owner_plan.capacity()),
+      program(mode == ParallelMode::Tensor
+          ? Qwen3_6_27B::create_tensor_program(*loaded->model, *pipeline_model,
+                std::move(owner_plan), std::move(tail_plan), owner_device, tail_device, observer)
+          : Qwen3_6_27B::create_pipeline_program(*loaded->model, *pipeline_model,
+                std::move(owner_plan), std::move(tail_plan), owner_device, tail_device, observer)) {}
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
 
@@ -194,7 +376,8 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 
-ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& device) {
+ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& device, DeviceGroup* group) {
+    ScopedDevice bind(device.device);
     validate_options(options);
     const auto load_start = Clock::now();
 
@@ -202,6 +385,14 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     artifact::Reader reader(options.artifact_path);
     inspect_phase.complete();
     const auto& identity = reader.identity();
+    if (options.placement.mode == ParallelMode::Pipeline) {
+        if (!group) throw std::invalid_argument("pipeline registry requires an Engine DeviceGroup");
+        return construct_pipeline(options, *group, reader, load_start);
+    }
+    if (options.placement.mode == ParallelMode::Tensor) {
+        if (!group) throw std::invalid_argument("TP2 registry requires an Engine DeviceGroup");
+        return construct_tensor(options, *group, reader, load_start);
+    }
     if (identity.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
             options, device, reader, load_start, Qwen3_6_27B::target_key);

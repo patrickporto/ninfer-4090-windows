@@ -1,4 +1,5 @@
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
+#include "targets/qwen3_6_27b/impl/load/tensor_weights.h"
 
 #include "artifact/typed_binding.h"
 
@@ -460,30 +461,15 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 
 } // namespace
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
+OwnerBindingPlan bind_owner_objects(artifact::Binder& binder, WeightsProfile weights_profile,
                                qwen3_6::StartupFeatures features) {
-    ArtifactLoadPlan load_plan;
-    BindingPlan& out = load_plan.bindings;
+    OwnerBindingPlan out;
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
     out.features     = features;
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
     out.token_embedding =
         bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
-    switch (weights_profile) {
-    case WeightsProfile::Qwen36GroupwiseInt:
-    case WeightsProfile::Qwen38GroupwiseInt:
-        bind_groupwise_text_layers(binder, out);
-        break;
-    case WeightsProfile::Qwen36Nvfp4:
-        bind_nvfp4_text_layers(binder, out);
-        break;
-    case WeightsProfile::Qwen38Nvfp4:
-        bind_qwen38_nvfp4_text_layers(binder, out);
-        break;
-    default:
-        throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
-    }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
     out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {248320, 5120});
@@ -547,27 +533,60 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         out.dflash2                               = bind_dflash2(binder, placement);
     }
 
+    return out;
+}
+
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
+                               qwen3_6::StartupFeatures features) {
+    ArtifactLoadPlan load_plan;
+    BindingPlan& out = load_plan.bindings;
+    out.owner = bind_owner_objects(binder, weights_profile, features);
+    switch (weights_profile) {
+    case WeightsProfile::Qwen36GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseInt:
+        bind_groupwise_text_layers(binder, out);
+        break;
+    case WeightsProfile::Qwen36Nvfp4:
+        bind_nvfp4_text_layers(binder, out);
+        break;
+    case WeightsProfile::Qwen38Nvfp4:
+        bind_qwen38_nvfp4_text_layers(binder, out);
+        break;
+    default:
+        throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
+    }
     load_plan.materialization = binder.finish();
     return load_plan;
 }
 
-LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized)
-    : backing(std::move(materialized)) {
-    frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
+LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
+                                 std::optional<PipelineStage> stage)
+    : pipeline_stage(stage), tensor_rank(std::nullopt), backing(std::move(materialized)) {
+    if (stage && (stage->layers.begin >= stage->layers.end || stage->layers.end > kTextLayers)) {
+        throw artifact::ArtifactError("invalid pipeline physical layer range");
+    }
+    const bool owns_non_decoder = !stage || stage->owns_non_decoder;
+    if (owns_non_decoder) frontend = qwen3_6::take_frontend_resources(backing, plan.owner.frontend);
 
     runtime.weights_arena = &backing.device_arena();
-    runtime.features      = plan.features;
+    runtime.features      = plan.owner.features;
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;
     auto& gdn_layers      = runtime.gdn_layers;
     auto& final_norm      = runtime.final_norm;
     auto& output_head     = runtime.output_head;
 
-    token_embedding        = materialized_weight(backing, plan.token_embedding, 248320, 5120);
+    if (owns_non_decoder)
+        token_embedding = materialized_weight(backing, plan.owner.token_embedding, 248320, 5120);
     std::size_t full_index = 0;
     std::size_t gdn_index  = 0;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         const TextLayerPlan& source = plan.text_layers[layer];
+        if (stage && (layer < stage->layers.begin || layer >= stage->layers.end)) {
+            if (source.is_full_attention) ++full_index;
+            else ++gdn_index;
+            continue;
+        }
         if (source.is_full_attention) {
             FullAttentionWeights& target = full_layers.at(full_index++);
             target.input_norm            = artifact::materialized_tensor(backing, source.input_norm,
@@ -604,51 +623,52 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     if (full_index != full_layers.size() || gdn_index != gdn_layers.size()) {
         throw std::logic_error("text topology binding is incomplete");
     }
+    if (!owns_non_decoder) return;
     final_norm =
-        artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {5120});
-    output_head = materialized_weight(backing, plan.output_head, 248320, 5120);
-    if (plan.features.optimized_proposal()) {
+        artifact::materialized_tensor(backing, plan.owner.final_norm, NumericFormat::BF16, {5120});
+    output_head = materialized_weight(backing, plan.owner.output_head, 248320, 5120);
+    if (plan.owner.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
-        proposal.head      = artifact::materialized_weight(backing, plan.draft_head,
+        proposal.head      = artifact::materialized_weight(backing, plan.owner.draft_head,
                                                            NumericFormat::Q4G64_F16S, 131072, 5120);
-        proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
+        proposal.token_ids = artifact::materialized_tensor(backing, plan.owner.draft_head_token_ids,
                                                            NumericFormat::I32, {131072});
     }
 
-    if (plan.features.mtp()) {
+    if (plan.owner.features.mtp()) {
         auto& mtp            = runtime.mtp.emplace();
         mtp.input_projection = artifact::materialized_weight(
-            backing, plan.mtp.input_projection, NumericFormat::W8G32_F16S, 5120, 10240);
-        mtp.embedding_norm   = artifact::materialized_tensor(backing, plan.mtp.embedding_norm,
+            backing, plan.owner.mtp.input_projection, NumericFormat::W8G32_F16S, 5120, 10240);
+        mtp.embedding_norm   = artifact::materialized_tensor(backing, plan.owner.mtp.embedding_norm,
                                                              NumericFormat::BF16, {5120});
-        mtp.hidden_norm      = artifact::materialized_tensor(backing, plan.mtp.hidden_norm,
+        mtp.hidden_norm      = artifact::materialized_tensor(backing, plan.owner.mtp.hidden_norm,
                                                              NumericFormat::BF16, {5120});
-        mtp.input_norm       = artifact::materialized_tensor(backing, plan.mtp.input_norm,
+        mtp.input_norm       = artifact::materialized_tensor(backing, plan.owner.mtp.input_norm,
                                                              NumericFormat::BF16, {5120});
         mtp.attention.packed = artifact::materialized_weight(
-            backing, plan.mtp.query_key_gate_value, NumericFormat::W8G32_F16S, 14336, 5120);
+            backing, plan.owner.mtp.query_key_gate_value, NumericFormat::W8G32_F16S, 14336, 5120);
         mtp.attention.query       = row_view(mtp.attention.packed, 0, 6144);
         mtp.attention.key         = row_view(mtp.attention.packed, 6144, 1024);
         mtp.attention.output_gate = row_view(mtp.attention.packed, 7168, 6144);
         mtp.attention.value       = row_view(mtp.attention.packed, 13312, 1024);
         mtp.query_norm =
-            artifact::materialized_tensor(backing, plan.mtp.query_norm, NumericFormat::BF16, {256});
+            artifact::materialized_tensor(backing, plan.owner.mtp.query_norm, NumericFormat::BF16, {256});
         mtp.key_norm =
-            artifact::materialized_tensor(backing, plan.mtp.key_norm, NumericFormat::BF16, {256});
-        mtp.output              = artifact::materialized_weight(backing, plan.mtp.output,
+            artifact::materialized_tensor(backing, plan.owner.mtp.key_norm, NumericFormat::BF16, {256});
+        mtp.output              = artifact::materialized_weight(backing, plan.owner.mtp.output,
                                                                 NumericFormat::W8G32_F16S, 5120, 6144);
         mtp.post_attention_norm = artifact::materialized_tensor(
-            backing, plan.mtp.post_attention_norm, NumericFormat::BF16, {5120});
-        mtp.post_mixer = load_mlp(plan.mtp.mlp, backing);
-        mtp.final_norm = artifact::materialized_tensor(backing, plan.mtp.final_norm,
+            backing, plan.owner.mtp.post_attention_norm, NumericFormat::BF16, {5120});
+        mtp.post_mixer = load_mlp(plan.owner.mtp.mlp, backing);
+        mtp.final_norm = artifact::materialized_tensor(backing, plan.owner.mtp.final_norm,
                                                        NumericFormat::BF16, {5120});
     }
 
-    if (plan.features.dflash2()) {
-        if (!plan.dflash2) {
+    if (plan.owner.features.dflash2()) {
+        if (!plan.owner.dflash2) {
             throw std::logic_error("selected DFlash2 weights are absent from the binding plan");
         }
-        const DFlash2Plan& source = *plan.dflash2;
+        const DFlash2Plan& source = *plan.owner.dflash2;
         auto& dflash2             = runtime.dflash.emplace();
         dflash2.feature_projection =
             materialized_weight(backing, source.feature_projection, 5120, 25600);
@@ -695,15 +715,85 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                           NumericFormat::BF16, {256, 248320});
     }
 
-    if (plan.features.vision) {
+    if (plan.owner.features.vision) {
         auto& vision  = runtime.vision.emplace();
         vision.common = qwen3_6::materialize_vision_common(
-            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
-        vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
+            backing, plan.owner.vision_backbone, plan.owner.vision_merger_input, plan.owner.vision_merger_norm);
+        vision.merger_fc2      = artifact::materialized_weight(backing, plan.owner.vision_merger_fc2,
                                                                NumericFormat::W8G32_F16S, 5120, 4608);
-        vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
+        vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.owner.vision_merger_fc2_bias,
                                                                NumericFormat::BF16, {5120});
     }
+}
+
+LoadedModelData::LoadedModelData(const OwnerBindingPlan& owner, const TensorRankBindingPlan& rank,
+                                 artifact::MaterializedArtifact materialized)
+    : pipeline_stage(std::nullopt), tensor_rank(rank.rank), backing(std::move(materialized)) {
+    using F = NumericFormat;
+    if (rank.rank > 1) throw artifact::ArtifactError("TP2 rank must be 0 or 1");
+    if (owner.features.vision || owner.features.mtp() || owner.features.optimized_proposal() ||
+        owner.features.masked_draft()) {
+        throw artifact::ArtifactError("TP2 eager execution binds text endpoints only");
+    }
+    const bool owner_rank = rank.rank == 0;
+    if (owner_rank) frontend = qwen3_6::take_frontend_resources(backing, owner.frontend);
+    runtime.weights_arena = &backing.device_arena();
+    runtime.features      = owner.features;
+    if (owner_rank)
+        runtime.token_embedding = materialized_weight(backing, owner.token_embedding, 248320, 5120);
+    std::size_t full_index = 0;
+    std::size_t gdn_index  = 0;
+    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+        const TensorLayerBindingPlan& source = rank.layers[layer];
+        const auto norm = [&](artifact::ObjectHandle handle, std::uint64_t width) {
+            return artifact::materialized_tensor(backing, handle, F::BF16, {width});
+        };
+        DensePostMixerPayload mlp{
+            .gate_up = materialized_weight(backing, source.mlp.gate_up, 17408, 5120),
+            .down    = materialized_weight(backing, source.mlp.down, 5120, 8704),
+        };
+        if (const auto* a = std::get_if<TensorAttentionPlan>(&source.mixer)) {
+            if (!is_full_layer(layer)) throw std::logic_error("TP2 attention plan on a GDN layer");
+            FullAttentionWeights& target = runtime.full_layers.at(full_index++);
+            target.input_norm = norm(source.input_norm, 5120);
+            target.projection = SplitAttentionProjectionPayload{
+                .query_key  = materialized_weight(backing, a->query_key, 3584, 5120),
+                .gate_value = materialized_weight(backing, a->gate_value, 3584, 5120),
+            };
+            target.query_norm          = norm(a->query_norm, 256);
+            target.key_norm            = norm(a->key_norm, 256);
+            target.output              = materialized_weight(backing, a->output, 5120, 3072);
+            target.post_attention_norm = norm(source.post_attention_norm, 5120);
+            target.post_mixer          = mlp;
+        } else {
+            const auto& g = std::get<TensorGdnPlan>(source.mixer);
+            if (is_full_layer(layer)) throw std::logic_error("TP2 GDN plan on an attention layer");
+            GdnWeights& target = runtime.gdn_layers.at(gdn_index++);
+            target.input_norm  = norm(source.input_norm, 5120);
+            target.projection.a_log   = artifact::materialized_tensor(backing, g.a_log, F::FP32, {24});
+            target.projection.dt_bias = artifact::materialized_tensor(backing, g.dt_bias, F::FP32, {24});
+            target.convolution =
+                artifact::materialized_tensor(backing, g.convolution, F::BF16, {5120, 4});
+            target.projection.control_projection = SplitGdnControlProjectionPayload{
+                .a_projection = materialized_weight(backing, g.a_projection, 24, 5120),
+                .b_projection = materialized_weight(backing, g.b_projection, 24, 5120),
+            };
+            target.projection.input_projection = SplitGdnInputProjectionPayload{
+                .query_key = materialized_weight(backing, g.query_key, 2048, 5120),
+                .value_z   = materialized_weight(backing, g.value_z, 6144, 5120),
+            };
+            target.norm                = norm(g.norm, 128);
+            target.output              = materialized_weight(backing, g.output, 5120, 3072);
+            target.post_attention_norm = norm(source.post_attention_norm, 5120);
+            target.post_mixer          = mlp;
+        }
+    }
+    if (full_index != runtime.full_layers.size() || gdn_index != runtime.gdn_layers.size()) {
+        throw std::logic_error("TP2 text topology binding is incomplete");
+    }
+    if (!owner_rank) return;
+    runtime.final_norm  = artifact::materialized_tensor(backing, owner.final_norm, F::BF16, {5120});
+    runtime.output_head = materialized_weight(backing, owner.output_head, 248320, 5120);
 }
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

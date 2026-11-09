@@ -3,6 +3,9 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "artifact/reader.h"
+#include "targets/qwen3_6_27b/impl/load/pipeline_weights.h"
+#include "targets/qwen3_6_27b/impl/load/tensor_weights.h"
+#include "targets/qwen3_6_27b/impl/parallel_plan.h"
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 #include "targets/qwen3_6_27b/impl/variant.h"
 
@@ -18,6 +21,13 @@ public:
 
     WeightsProfile weights_profile;
     ArtifactLoadPlan plan;
+    std::optional<PipelineStage> stage;
+    // TP2 rank load: plan.materialization holds only this rank's allocation.
+    struct TensorRank {
+        OwnerBindingPlan owner;
+        TensorRankBindingPlan rank;
+    };
+    std::optional<TensorRank> tensor;
 };
 
 LoadPlan::LoadPlan(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -106,11 +116,44 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
         detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
 }
 
+std::array<Package::LoadPlan, 2> Package::plan_pipeline_load(
+    artifact::Binder& binder, const EngineOptions& options, WeightsProfile weights_profile) {
+    const auto cut = options.placement.pipeline_layers.at(0).end;
+    auto full = detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options));
+    auto materializations = detail::pipeline_materialization_plans(full, cut);
+    auto first = std::make_unique<LoadPlan::Impl>(weights_profile,
+        detail::ArtifactLoadPlan{full.bindings, std::move(materializations[0])});
+    auto second = std::make_unique<LoadPlan::Impl>(weights_profile,
+        detail::ArtifactLoadPlan{std::move(full.bindings), std::move(materializations[1])});
+    first->stage = detail::PipelineStage{{0, cut}, true};
+    second->stage = detail::PipelineStage{{cut, 64}, false};
+    return {LoadPlan(std::move(first)), LoadPlan(std::move(second))};
+}
+
+std::array<Package::LoadPlan, 2> Package::plan_tensor_load(const artifact::Reader& reader,
+                                                          const EngineOptions& options) {
+    auto tensor = detail::bind_tensor_artifact(reader, qwen3_6::startup_features(options));
+    std::array<std::unique_ptr<LoadPlan::Impl>, 2> ranks;
+    for (std::size_t rank = 0; rank < 2; ++rank) {
+        ranks[rank] = std::make_unique<LoadPlan::Impl>(
+            WeightsProfile::Qwen38GroupwiseInt,
+            detail::ArtifactLoadPlan{{}, std::move(tensor.materialization[rank])});
+        ranks[rank]->tensor.emplace(LoadPlan::Impl::TensorRank{tensor.owner, tensor.ranks[rank]});
+    }
+    return {LoadPlan(std::move(ranks[0])), LoadPlan(std::move(ranks[1]))};
+}
+
 std::unique_ptr<Package::LoadedModel>
 Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("target load plan is empty"); }
+    if (plan.impl_->tensor) {
+        auto impl = std::make_unique<LoadedModel::Impl>(plan.impl_->weights_profile,
+            plan.impl_->tensor->owner, plan.impl_->tensor->rank, std::move(materialized));
+        plan.impl_.reset();
+        return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
+    }
     auto impl = std::make_unique<LoadedModel::Impl>(
-        plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized));
+        plan.impl_->weights_profile, std::move(plan.impl_->plan.bindings), std::move(materialized), plan.impl_->stage);
     plan.impl_.reset();
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
@@ -130,8 +173,11 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
 
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
-                                                        WeightsProfile weights_profile) {
-    return qwen3_6::make_sequence_planner<detail::Variant>(device, options, weights_profile);
+                                                        WeightsProfile weights_profile,
+                                                        std::optional<PhysicalLayerRange> pipeline_layers,
+                                                        std::optional<std::uint32_t> tensor_rank) {
+    return qwen3_6::make_sequence_planner<detail::Variant>(device, options, weights_profile,
+                                                           pipeline_layers, tensor_rank);
 }
 
 std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& model,
@@ -139,9 +185,43 @@ std::unique_ptr<Package::Program> Package::create_program(const LoadedModel& mod
                                                           DeviceContext& device,
                                                           const StartupObserver& startup_observer) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
+    if (model.impl_->data.pipeline_stage)
+        throw std::invalid_argument("pipeline stage weights require the pipeline Program constructor");
+    if (model.impl_->data.tensor_rank)
+        throw std::invalid_argument("TP2 rank weights require the tensor Program constructor");
     return qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime,
                                                     model.impl_->weights_profile, std::move(plan),
                                                     device, startup_observer);
+}
+
+std::unique_ptr<Package::Program> Package::create_pipeline_program(
+    const LoadedModel& owner_model, const LoadedModel& tail_model,
+    SequencePlan&& owner_plan, SequencePlan&& tail_plan,
+    DeviceContext& owner_device, DeviceContext& tail_device,
+    const StartupObserver& observer) {
+    if (!owner_model.impl_ || !tail_model.impl_ ||
+        !owner_model.impl_->data.pipeline_stage || !tail_model.impl_->data.pipeline_stage) {
+        throw std::invalid_argument("pipeline loaded models require stage ownership");
+    }
+    return qwen3_6::create_pipeline_program<detail::Variant>(
+        owner_model.impl_->data.runtime, tail_model.impl_->data.runtime,
+        owner_model.impl_->weights_profile, std::move(owner_plan), std::move(tail_plan),
+        owner_device, tail_device, observer);
+}
+
+std::unique_ptr<Package::Program> Package::create_tensor_program(
+    const LoadedModel& owner_model, const LoadedModel& tail_model,
+    SequencePlan&& owner_plan, SequencePlan&& tail_plan,
+    DeviceContext& owner_device, DeviceContext& tail_device,
+    const StartupObserver& observer) {
+    if (!owner_model.impl_ || !tail_model.impl_ || owner_model.impl_->data.tensor_rank != 0U ||
+        tail_model.impl_->data.tensor_rank != 1U) {
+        throw std::invalid_argument("TP2 loaded models require rank-0 and rank-1 ownership");
+    }
+    return qwen3_6::create_tensor_program<detail::Variant>(
+        owner_model.impl_->data.runtime, tail_model.impl_->data.runtime,
+        owner_model.impl_->weights_profile, std::move(owner_plan), std::move(tail_plan),
+        owner_device, tail_device, observer);
 }
 
 } // namespace ninfer::targets::qwen3_6_27b

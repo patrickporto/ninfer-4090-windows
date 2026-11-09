@@ -1,6 +1,12 @@
+#include "targets/qwen3_6/impl/runtime/pipeline_schedule.h"
 #include "ninfer/engine.h"
 
 #include "core/device.h"
+#include "core/device_group.h"
+#include "core/cuda_error_scope.h"
+#include "core/tensor_collective.h"
+#include "artifact/reader.h"
+#include "targets/qwen3_6_27b/impl/parallel_plan.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
 #include "runtime/contract/sampling.h"
@@ -33,6 +39,12 @@ namespace ninfer {
 namespace {
 
 EngineOptions normalize_engine_options(EngineOptions options) {
+    targets::qwen3_6::runtime_support::require_runtime_placement(options);
+    // Validate the caller's feature choices before scoring normalizes its Single defaults.
+    if (options.placement.mode == ParallelMode::Pipeline)
+        targets::qwen3_6::runtime_support::require_pipeline_eager_options(options);
+    if (options.placement.mode == ParallelMode::Tensor)
+        targets::qwen3_6::runtime_support::require_tensor_eager_options(options);
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;
@@ -102,11 +114,31 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     return options;
 }
 
-DeviceContext initialize_device(const EngineOptions& options) {
+std::unique_ptr<DeviceGroup> initialize_devices(const EngineOptions& options) {
+    ScopedCudaErrors errors(options.placement.mode != ParallelMode::Single);
+    if (options.placement.mode == ParallelMode::Pipeline) {
+        // Identity and all closed placement gates precede CUDA context creation or allocation.
+        artifact::Reader reader(options.artifact_path);
+        (void)targets::qwen3_6_27b::detail::ParallelPlan::create(options,
+            reader.identity().model_id, reader.identity().weights_id);
+        for (const auto range : options.placement.pipeline_layers)
+            targets::qwen3_6::runtime_support::StageLayerLayout::create(range, 64).require_pipeline_pools();
+    }
+    if (options.placement.mode == ParallelMode::Tensor) {
+        artifact::Reader reader(options.artifact_path);
+        (void)targets::qwen3_6_27b::detail::ParallelPlan::create(options,
+            reader.identity().model_id, reader.identity().weights_id);
+        if (reader.identity().weights_id != "groupwise-int-tp2")
+            throw std::invalid_argument(
+                "TP2 placement requires the qwen3.8-27b/groupwise-int-tp2 sharded artifact");
+        if (!TensorCollective::available())
+            throw std::invalid_argument("TP2 placement requires a build with NINFER_ENABLE_NCCL");
+    }
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
-    DeviceContext device(options.device);
+    auto group = std::make_unique<DeviceGroup>(options.placement.mode == ParallelMode::Single
+        ? std::vector<int>{options.device} : options.placement.devices);
     phase.complete();
-    return device;
+    return group;
 }
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
@@ -246,9 +278,11 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(normalize_engine_options(std::move(engine_options))),
-          device(initialize_device(options)) {
+          devices(initialize_devices(options)), device(devices->context(0)) {
+        ScopedCudaErrors errors(options.placement.mode != ParallelMode::Single);
+        ScopedDevice bind(device.device);
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
-        auto constructed  = targets::construct_target(options, device);
+        auto constructed  = targets::construct_target(options, device, devices.get());
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
         sampling_defaults = constructed.sampling_defaults;
@@ -259,13 +293,13 @@ public:
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
                 if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
                     if (options.purpose == EnginePurpose::CausalScoring) {
-                        return std::make_unique<ScoreCore27>(*target_ptr, device);
+                        return std::make_unique<ScoreCore27>(*target_ptr, device, options.placement.mode != ParallelMode::Single);
                     }
                     return std::make_unique<Core27>(*target_ptr, device, options,
                                                     std::move(constructed.context_cost));
                 } else {
                     if (options.purpose == EnginePurpose::CausalScoring) {
-                        return std::make_unique<ScoreCore35>(*target_ptr, device);
+                        return std::make_unique<ScoreCore35>(*target_ptr, device, options.placement.mode != ParallelMode::Single);
                     }
                     return std::make_unique<Core35>(*target_ptr, device, options,
                                                     std::move(constructed.context_cost));
@@ -328,7 +362,8 @@ public:
     }
 
     EngineOptions options;
-    DeviceContext device;
+    std::unique_ptr<DeviceGroup> devices;
+    DeviceContext& device;
     targets::ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;

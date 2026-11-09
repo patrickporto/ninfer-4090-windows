@@ -596,8 +596,8 @@ int test_content_and_cache_hints() {
                       "Files image source was flattened or ignored");
     body["messages"][0]["content"] =
         Json::array({Json{{"type", "document"}, {"source", Json::object()}}});
-    failures += check(api_code([&] { (void)parse(body); }) == "documents_not_supported",
-                      "document citation semantics were silently discarded");
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_document",
+                      "document source without a type was accepted");
     return failures;
 }
 

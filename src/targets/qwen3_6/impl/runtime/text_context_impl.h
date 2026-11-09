@@ -224,8 +224,11 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
                          std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
                          qwen3_6::PagedKVCacheView mtp_kv,
                          const qwen3_6::PagedKVCache* batch_text_kv,
-                         const qwen3_6::PagedKVCache* batch_mtp_kv)
-    : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
+                         const qwen3_6::PagedKVCache* batch_mtp_kv,
+                         std::optional<PhysicalLayerRange> pipeline_layers)
+    : stage_layers_(runtime_support::StageLayerLayout::create(
+          pipeline_layers.value_or(PhysicalLayerRange{0, TextConfig::layers}), TextConfig::layers)),
+      pipeline_stage_(pipeline_layers.has_value()), ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
       prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base),
       batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv) {
     if (prefill_chunk_ == 0 ||
@@ -234,6 +237,20 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
     }
     if (mtp_enabled() && !io_.mtp_decode && !io_.mtp) {
         throw std::invalid_argument("MTP TextContext requires MTP round state");
+    }
+    if (pipeline_stage_) {
+        stage_layers_.require_pipeline_pools();
+        if (mtp_enabled() || weights_.features.vision || weights_.features.mtp() ||
+            weights_.features.masked_draft()) {
+            throw std::invalid_argument("M2 pipeline TextContext supports eager text only");
+        }
+        if (batch_text_kv_ == nullptr ||
+            batch_text_kv_->layers() != stage_layers_.full_attention_count()) {
+            throw std::invalid_argument("pipeline KV pool does not match stage-local layer count");
+        }
+        if (state_.layer_count() != stage_layers_.gdn_count()) {
+            throw std::invalid_argument("pipeline GDN pool does not match stage-local layer count");
+        }
     }
     set_linear_state_slots(0, 0);
     bind();
@@ -264,9 +281,11 @@ void TextContext::bind() {
     using TargetMlp      = MlpWeights;
     const auto bind_mlp  = [](const TargetMlp& source) { return MlpW{&source}; };
 
-    embed_      = &weights_.token_embedding;
-    final_norm_ = &weights_.final_norm;
-    lm_head_    = &weights_.output_head;
+    if (stage_layers_.range().begin == 0) {
+        embed_      = &weights_.token_embedding;
+        final_norm_ = &weights_.final_norm;
+        lm_head_    = &weights_.output_head;
+    }
     if (weights_.optimized_proposal) {
         const auto& proposal = *weights_.optimized_proposal;
         set_proposal_head(&proposal.head, static_cast<const std::int32_t*>(proposal.token_ids.data),
@@ -290,7 +309,8 @@ void TextContext::bind() {
                     &source.final_norm};
     }
 
-    for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+    for (int layer = static_cast<int>(stage_layers_.range().begin);
+         layer < static_cast<int>(stage_layers_.range().end); ++layer) {
         if (ModelConfig::is_full(layer)) {
             FullLayerW& out = full_[static_cast<std::size_t>(ModelConfig::full_idx(layer))];
             const auto& source =
@@ -644,12 +664,92 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     proposal_argmax(mtp_hidden, logits, draft_token);
 }
 
+void TextContext::pipeline_embedding(const Tensor& ids, Tensor& residual) {
+    if (!pipeline_stage_ || stage_layers_.range().begin != 0) {
+        throw std::logic_error("pipeline embedding belongs to stage 0");
+    }
+    require_tensor_shape(ids, DType::I32, {residual.ne[1]}, "pipeline ids");
+    require_tensor_shape(residual, DType::BF16, {kCfg.hidden, ids.ne[0]}, "pipeline residual");
+    ops::embedding(ids, *embed_, residual, ctx_.stream);
+}
+
+void TextContext::pipeline_prefill_stage(Tensor& residual, const Tensor& cache_positions,
+                                        const Tensor& rope_positions, const Tensor& kv_table_row,
+                                        ops::CausalAttentionExecutionEnvelope envelope) {
+    if (!pipeline_stage_) { throw std::logic_error("pipeline stage requires a physical range"); }
+    const int tokens = residual.ne[1];
+    if (tokens <= 0 || tokens > static_cast<int>(prefill_chunk_)) {
+        throw std::invalid_argument("pipeline prefill exceeds planned chunk");
+    }
+    require_tensor_shape(residual, DType::BF16, {kCfg.hidden, tokens}, "pipeline residual");
+    require_tensor_shape(cache_positions, DType::I32, {tokens}, "pipeline cache positions");
+    require_tensor_shape(rope_positions, DType::I32, {tokens}, "pipeline rope positions");
+    require_tensor_shape(kv_table_row, DType::I32, {1}, "pipeline KV row");
+    work_.reset();
+    ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &kv_table_row);
+    ScopedPositions cache_binding(active_cache_positions_, cache_positions);
+    ScopedPositions rope_binding(active_rope_positions_, rope_positions);
+    ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
+    run_layers(residual, Phase::Prefill);
+    work_.reset();
+}
+
+void TextContext::pipeline_decode_stage(Tensor& residual, const Tensor& cache_positions,
+                                       const Tensor& rope_positions, const Tensor& kv_table_rows,
+                                       const Tensor& linear_state_source_slots,
+                                       const Tensor& linear_state_destination_slots,
+                                       ops::CausalAttentionExecutionEnvelope envelope) {
+    if (!pipeline_stage_) { throw std::logic_error("pipeline stage requires a physical range"); }
+    const int batch = residual.ne[1];
+    if (batch <= 0 || batch > static_cast<int>(kMaximumConcurrency)) {
+        throw std::invalid_argument("pipeline decode batch size must be in [1,8]");
+    }
+    require_tensor_shape(residual, DType::BF16, {kCfg.hidden, batch}, "pipeline residual");
+    require_tensor_shape(cache_positions, DType::I32, {batch}, "pipeline cache positions");
+    require_tensor_shape(rope_positions, DType::I32, {batch}, "pipeline rope positions");
+    require_tensor_shape(kv_table_rows, DType::I32, {batch}, "pipeline KV rows");
+    require_tensor_shape(linear_state_source_slots, DType::I32, {batch}, "pipeline source slots");
+    require_tensor_shape(linear_state_destination_slots, DType::I32, {batch}, "pipeline destination slots");
+    work_.reset();
+    ScopedPositions cache_binding(active_cache_positions_, cache_positions);
+    ScopedPositions rope_binding(active_rope_positions_, rope_positions);
+    ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
+    ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &kv_table_rows);
+    ScopedValue<const Tensor*> source_binding(active_linear_state_source_slots_, &linear_state_source_slots);
+    ScopedValue<const Tensor*> destination_binding(active_linear_state_destination_slots_, &linear_state_destination_slots);
+    ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
+    ScopedValue<std::int32_t> width_binding(active_sequence_width_, 1);
+    run_layers(residual, Phase::Verify);
+    work_.reset();
+}
+
+void TextContext::pipeline_final_norm(const Tensor& residual, Tensor& hidden) {
+    if (!pipeline_stage_ || stage_layers_.range().begin != 0) {
+        throw std::logic_error("pipeline final norm belongs to stage 0");
+    }
+    require_tensor_shape(residual, DType::BF16, {kCfg.hidden, hidden.ne[1]}, "pipeline residual");
+    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, residual.ne[1]}, "pipeline hidden");
+    ops::rmsnorm(residual, *final_norm_, kCfg.rms_eps, true, hidden, ctx_.stream);
+}
+
+void TextContext::pipeline_head(const Tensor& hidden, Tensor& logits) {
+    if (!pipeline_stage_ || stage_layers_.range().begin != 0) {
+        throw std::logic_error("pipeline head belongs to stage 0");
+    }
+    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, logits.ne[1]}, "pipeline hidden");
+    require_tensor_shape(logits, DType::BF16, {kCfg.vocab, hidden.ne[1]}, "pipeline logits");
+    ops::linear(hidden, *lm_head_, logits, ctx_.stream);
+}
+
 void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                         const Tensor& rope_positions, const Tensor& kv_table_rows,
                                         const Tensor& linear_state_source_slots,
                                         const Tensor& linear_state_destination_slots,
                                         ops::CausalAttentionExecutionEnvelope envelope,
                                         Tensor& hidden, Tensor& logits) {
+    if (pipeline_stage_) {
+        throw std::logic_error("pipeline decode requires explicit stage coordination");
+    }
     const std::int32_t batch = ids.ne[0];
     if (batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("ordinary decode batch size must be in [1,8]");
@@ -989,7 +1089,7 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
     // Name the next layer's projection codes so this layer's MoE D4 epilogue can warm L2 for
     // them. The last layer names nothing. A pure hint: the value never reaches arithmetic.
     const int next = layer + 1;
-    if (next >= kCfg.n_layers) { return {}; }
+    if (next >= static_cast<int>(stage_layers_.range().end)) { return {}; }
     if (ModelConfig::is_full(next)) {
         return Variant::projection_prefetch_hints(
             *full_.at(static_cast<std::size_t>(ModelConfig::full_idx(next))).projection);
@@ -1011,7 +1111,8 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
-    for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+    for (int layer = static_cast<int>(stage_layers_.range().begin);
+         layer < static_cast<int>(stage_layers_.range().end); ++layer) {
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
@@ -1023,7 +1124,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
                     nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
-                attn_mix(full, x, fidx, ph);
+                attn_mix(full, x, static_cast<int>(stage_layers_.local_full_attention_index(layer)), ph);
             }
             {
                 nvtx::ScopedRange post_mixer_range(
@@ -1044,7 +1145,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn, nvtx::Category::Gdn,
                     static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
-                gdn_mix(gdn, x, gidx, ph);
+                gdn_mix(gdn, x, static_cast<int>(stage_layers_.local_gdn_index(layer)), ph);
             }
             {
                 nvtx::ScopedRange post_mixer_range(
@@ -1067,6 +1168,9 @@ template <class Tap>
 PrefillChunkResult
 TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
                           const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end) {
+    if (pipeline_stage_) {
+        throw std::logic_error("pipeline prefill requires explicit stage coordination");
+    }
     runtime::ExecutionTimingRecorder timing;
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {

@@ -5,6 +5,7 @@
 #include "ops/common/act_quant_g64.h"
 #include "ops/common/int8_rowsplit_gemm.cuh"
 
+#include "core/cuda_function_config.h"
 #include "core/device.h"
 #include "ops/common/math.h"
 
@@ -21,13 +22,8 @@ constexpr Int8GemmEpilogue kResidual = Int8GemmEpilogue::AddResidual;
 template <class Cfg, bool Full>
 void launch_int8(const std::int8_t* xq, const float* xs, const Weight& weight, Tensor& residual_out,
                  std::int32_t tokens, std::int32_t padded_k, cudaStream_t stream) {
-    static const bool configured = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(int8_rowsplit_gemm_kernel<Cfg, Full, kResidual>,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        Cfg::kSharedBytes));
-        return true;
-    }();
-    (void)configured;
+    configure_cuda_shared_memory(int8_rowsplit_gemm_kernel<Cfg, Full, kResidual>,
+                                 Cfg::kSharedBytes);
 
     const dim3 grid(static_cast<unsigned>(div_up(residual_out.ne[0], Cfg::kBlockRows)),
                     static_cast<unsigned>(div_up(tokens, Cfg::kBlockCols)));

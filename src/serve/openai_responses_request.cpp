@@ -1,3 +1,4 @@
+#include "serve/document_input.h"
 #include "serve/openai_responses.h"
 #include "serve/openai_common.h"
 #include "serve/request_validation.h"
@@ -261,8 +262,15 @@ void parse_message_content_part(const Json& value, ChatRole role, ParsedMessage&
         return;
     }
     if (type == "input_file") {
-        bad_request("input_file requires a Files API, which NInfer does not provide", "input",
-                    "file_inputs_not_supported");
+        if (role != ChatRole::User) { bad_request("input_file is only supported on user messages", "input"); }
+        ContentPart part;
+        part.kind = ContentKind::Document;
+        part.type_raw = type;
+        part.source = parse_pdf_source(value, "input");
+        apply_shared_breakpoint(part, value, breakpoint_count);
+        parsed.turn.content.push_back(std::move(part));
+        content.push_back(value);
+        return;
     }
     if (type == "input_audio") {
         bad_request("input_audio is not supported by the Engine", "input",
@@ -497,8 +505,12 @@ ChatTurn parse_function_call_output_item(
                 apply_shared_breakpoint(part, value, breakpoint_count);
                 turn.content.push_back(std::move(part));
             } else if (type == "input_file") {
-                bad_request("tool result input_file requires a Files API", "input",
-                            "file_inputs_not_supported");
+                ContentPart part;
+                part.kind = ContentKind::Document;
+                part.type_raw = type;
+                part.source = parse_pdf_source(value, "input");
+                apply_shared_breakpoint(part, value, breakpoint_count);
+                turn.content.push_back(std::move(part));
             } else {
                 bad_request("unsupported function_call_output content type: " + type, "input",
                             "modality_not_supported");

@@ -42,7 +42,7 @@ void discard_capture(cudaStream_t stream) noexcept {
 DecodeGraphDefinition::~DecodeGraphDefinition() { reset(); }
 
 DecodeGraphDefinition::DecodeGraphDefinition(DecodeGraphDefinition&& other) noexcept
-    : graph_(other.graph_) {
+    : device_(other.device_), graph_(other.graph_) {
     other.graph_ = nullptr;
 }
 
@@ -50,6 +50,7 @@ DecodeGraphDefinition& DecodeGraphDefinition::operator=(DecodeGraphDefinition&& 
     if (this == &other) { return *this; }
 
     reset();
+    device_ = other.device_;
     graph_ = other.graph_;
 
     other.graph_ = nullptr;
@@ -60,6 +61,8 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
     nvtx::ScopedRange capture_range(nvtx::Name::CudaGraphCapture, nvtx::Category::Graph);
     reset();
 
+    device_ = cuda_stream_device(stream);
+    ScopedDevice binding(device_);
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
 
     try {
@@ -82,12 +85,14 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
 
 bool DecodeGraphDefinition::ready() const noexcept { return graph_ != nullptr; }
 
-void DecodeGraphDefinition::reset() noexcept { destroy_graph(graph_); }
+void DecodeGraphDefinition::reset() noexcept {
+    if (graph_) { ScopedDevice binding(device_, std::nothrow); destroy_graph(graph_); }
+}
 
 DecodeGraphExecutable::~DecodeGraphExecutable() { reset(); }
 
 DecodeGraphExecutable::DecodeGraphExecutable(DecodeGraphExecutable&& other) noexcept
-    : exec_(other.exec_) {
+    : device_(other.device_), exec_(other.exec_) {
     other.exec_ = nullptr;
 }
 
@@ -95,6 +100,7 @@ DecodeGraphExecutable& DecodeGraphExecutable::operator=(DecodeGraphExecutable&& 
     if (this == &other) { return *this; }
 
     reset();
+    device_ = other.device_;
     exec_       = other.exec_;
     other.exec_ = nullptr;
     return *this;
@@ -107,6 +113,8 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
     }
     reset();
 
+    device_ = definition.device_;
+    ScopedDevice binding(device_);
     cudaGraphExec_t exec  = nullptr;
     const cudaError_t err = cudaGraphInstantiate(&exec, definition.graph_, 0);
     if (err != cudaSuccess) {
@@ -122,6 +130,8 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
         throw std::logic_error("CUDA Graph update requires a definition and executable");
     }
 
+    if (device_ != definition.device_) throw std::invalid_argument("graph update device mismatch");
+    ScopedDevice binding(device_);
     cudaGraphExecUpdateResultInfo result{};
     const cudaError_t err = cudaGraphExecUpdate(exec_, definition.graph_, &result);
     if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
@@ -134,6 +144,8 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
 void DecodeGraphExecutable::upload(cudaStream_t stream) {
     nvtx::ScopedRange upload_range(nvtx::Name::CudaGraphUpload, nvtx::Category::Graph);
     if (!ready()) { throw std::logic_error("cannot upload an empty CUDA Graph executable"); }
+    if (cuda_stream_device(stream) != device_) throw std::invalid_argument("graph upload device mismatch");
+    ScopedDevice binding(device_);
     CUDA_CHECK(cudaGraphUpload(exec_, stream));
 }
 
@@ -141,11 +153,15 @@ void DecodeGraphExecutable::launch(cudaStream_t stream) {
     // This range executes for every replay; ranges in the captured body execute only at capture.
     nvtx::ScopedRange launch_range(nvtx::Name::CudaGraphLaunch, nvtx::Category::Graph);
     if (!ready()) { throw std::logic_error("cannot launch an empty CUDA Graph executable"); }
+    if (cuda_stream_device(stream) != device_) throw std::invalid_argument("graph launch device mismatch");
+    ScopedDevice binding(device_);
     CUDA_CHECK(cudaGraphLaunch(exec_, stream));
 }
 
 bool DecodeGraphExecutable::ready() const noexcept { return exec_ != nullptr; }
 
-void DecodeGraphExecutable::reset() noexcept { destroy_graph_exec(exec_); }
+void DecodeGraphExecutable::reset() noexcept {
+    if (exec_) { ScopedDevice binding(device_, std::nothrow); destroy_graph_exec(exec_); }
+}
 
 } // namespace ninfer

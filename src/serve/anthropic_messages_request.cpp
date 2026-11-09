@@ -1,3 +1,4 @@
+#include "serve/document_input.h"
 #include "serve/anthropic_messages.h"
 #include "serve/request_validation.h"
 
@@ -280,9 +281,22 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content) {
         } else if (type == "tool_result") {
             result.emplace_back(parse_tool_result(block));
         } else if (type == "document") {
-            bad_request("document blocks require document and citation semantics that NInfer does "
-                        "not provide",
-                        "messages", "documents_not_supported");
+            ContentPart part;
+            part.kind = ContentKind::Document;
+            part.type_raw = "document";
+            part.source = parse_anthropic_pdf_source(block);
+            for (const char* field : {"title", "context"}) {
+                if (block.contains(field) && !block.at(field).is_null()) {
+                    if (!block.at(field).is_string()) {
+                        bad_request(std::string("document.") + field + " must be a string", "messages");
+                    }
+                    part.text += std::string("[PDF ") + field + "] " + block.at(field).get<std::string>() + "\n";
+                }
+            }
+            if (const auto ttl = cache_boundary(block, "messages")) {
+                part.cache_boundary_after = explicit_cache_boundary(*ttl);
+            }
+            result.emplace_back(std::move(part));
         } else if (type == "search_result") {
             bad_request("search_result blocks require source and citation semantics that NInfer "
                         "does not provide",

@@ -3,6 +3,7 @@
 // Small fixed-capacity request execution for every backend.
 
 #include "core/device.h"
+#include "core/cuda_error_scope.h"
 #include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
@@ -102,7 +103,9 @@ public:
             [this](std::uint32_t slot) { clear_slot_session(slot); });
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
-        worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
+        worker_                   = std::thread([this, startup = std::move(startup),
+            pipeline = options.placement.mode != ParallelMode::Single]() mutable {
+            ScopedCudaErrors errors(pipeline);
             try {
                 device_.bind_to_current_thread();
                 startup.set_value();
@@ -253,7 +256,7 @@ public:
     }
 
     [[nodiscard]] MemorySummary memory_summary() const {
-        std::scoped_lock lock(execution_mutex_);
+        ExternalExecutionLock lock(*this);
         MemorySummary out                      = instance_.program->memory_summary();
         const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
         out.kv_capacity_mode                   = resolution.mode;
@@ -266,6 +269,20 @@ public:
         out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
         out.kv_capacity_headroom_bytes         = resolution.automatic_headroom_bytes;
         out.planned_slack_bytes                = resolution.planned_slack_bytes;
+        out.physical_devices[0].runtime_reservation_bytes = resolution.runtime_reservation_bytes;
+        out.physical_devices[0].available_after_weights_bytes = resolution.available_after_weights_bytes;
+        out.physical_devices[0].available_after_startup_bytes = resolution.available_after_startup_bytes;
+        if constexpr (requires { instance_.pipeline_capacity; }) {
+            if (out.physical_device_count == 2) {
+                for (unsigned rank = 0; rank < 2; ++rank) {
+                    const auto& capacity = instance_.pipeline_capacity[rank];
+                    auto& physical = out.physical_devices[rank];
+                    physical.runtime_reservation_bytes = capacity.runtime_reservation_bytes;
+                    physical.available_after_weights_bytes = capacity.available_after_weights_bytes;
+                    physical.available_after_startup_bytes = capacity.available_after_startup_bytes;
+                }
+            }
+        }
         return out;
     }
 
@@ -290,7 +307,7 @@ public:
 
     void reset_memory_peaks() noexcept {
         try {
-            std::scoped_lock lock(execution_mutex_);
+            ExternalExecutionLock lock(*this);
             instance_.program->reset_memory_peaks();
         } catch (...) {}
     }
@@ -309,7 +326,7 @@ public:
     [[nodiscard]] targets::qwen3_6::RetainedSessionSnapshot
     save_retained_lane(std::uint32_t slot, std::string_view model_binding,
                        std::string_view expected_digest, std::string_view session_path = {}) {
-        std::scoped_lock lock(execution_mutex_);
+        ExternalExecutionLock lock(*this);
         require_settled_slot(slot);
         const typename ResourceManagement::CatalogSlotView view = resources_.catalog_slot(slot);
         if (view.state != ResourceManagement::CatalogState::Catalogued || view.handle == nullptr) {
@@ -324,7 +341,7 @@ public:
     [[nodiscard]] std::pair<std::uint32_t, std::string>
     restore_retained_lane(std::uint32_t slot, std::span<const std::uint8_t> snapshot,
                           std::string_view model_binding, std::string_view session_path = {}) {
-        std::scoped_lock lock(execution_mutex_);
+        ExternalExecutionLock lock(*this);
         if (!context_cache_enabled_) {
             // Without the cache no finished request retains its session, so a restored
             // continuation could never be reused; refuse instead of stranding it.
@@ -368,7 +385,7 @@ public:
     }
 
     std::uint32_t erase_retained_lane(std::uint32_t slot, std::string_view expected_digest) {
-        std::scoped_lock lock(execution_mutex_);
+        ExternalExecutionLock lock(*this);
         require_settled_slot(slot);
         const typename ResourceManagement::CatalogSlotView view = resources_.catalog_slot(slot);
         require_session_digest(view, expected_digest);
@@ -402,7 +419,7 @@ public:
     void set_eviction_sink(
         std::string model_binding,
         std::function<void(std::string, targets::qwen3_6::RetainedSessionSnapshot&&)> sink) {
-        std::scoped_lock lock(execution_mutex_);
+        ExternalExecutionLock lock(*this);
         eviction_model_binding_ = std::move(model_binding);
         eviction_sink_          = std::move(sink);
     }
@@ -2268,6 +2285,7 @@ private:
                 }
             }
 
+            yield_to_external_execution_waiters();
             std::unique_lock execution_lock(execution_mutex_);
             try {
                 set_host_work_class(HostWorkClass::Control);
@@ -2356,6 +2374,25 @@ private:
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;
+    // std::mutex is not fair: the worker re-locks execution_mutex_ immediately after each unit, so
+    // API callers announce themselves and the worker yields at its loop boundary until they acquire.
+    mutable std::atomic<std::uint32_t> external_execution_waiters_{0};
+    struct ExternalExecutionLock {
+        explicit ExternalExecutionLock(const EngineCore& core) : core_(core) {
+            core_.external_execution_waiters_.fetch_add(1, std::memory_order_acq_rel);
+            lock_ = std::unique_lock(core_.execution_mutex_);
+            core_.external_execution_waiters_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        const EngineCore& core_;
+        std::unique_lock<std::mutex> lock_;
+    };
+    void yield_to_external_execution_waiters() const {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+        while (external_execution_waiters_.load(std::memory_order_acquire) != 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+    }
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
     std::condition_variable queue_cv_;

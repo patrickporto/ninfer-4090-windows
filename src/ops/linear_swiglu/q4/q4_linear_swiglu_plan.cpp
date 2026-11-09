@@ -30,6 +30,7 @@ struct RouteSpec {
 };
 
 constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
+constexpr std::int32_t kLocalA16MaxCols = 32; // GemvPair (1) and SmallTTiled (2..32)
 
 constexpr std::array<RouteSpec, 10> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
@@ -57,9 +58,13 @@ constexpr bool catalog_is_closed() noexcept {
 static_assert(catalog_is_closed(), "Q4 LinearSwiGLU routes must be exact, contiguous, and closed");
 
 bool supported_shape(const Q4LinearSwiGluProblem& problem) noexcept {
-    return problem.gate_up_rows == kShape.gate_up_rows &&
-           problem.output_rows == kShape.output_rows && problem.k == kShape.k &&
-           problem.padded_k == kShape.padded_k;
+    const bool full =
+        problem.gate_up_rows == kShape.gate_up_rows && problem.output_rows == kShape.output_rows;
+    // TP2 rank-local profile: A8 for every extent (prefill), A16 GEMV/small-T for decode extents.
+    const bool local = problem.gate_up_rows == 17408 && problem.output_rows == 8704 &&
+                       (problem.policy == LinearPolicy::AllowA8 ||
+                        (problem.policy == LinearPolicy::A16Only && problem.cols <= kLocalA16MaxCols));
+    return (full || local) && problem.k == kShape.k && problem.padded_k == kShape.padded_k;
 }
 
 template <class Allocator>

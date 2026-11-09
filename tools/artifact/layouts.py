@@ -16,7 +16,22 @@ import sys
 from types import MappingProxyType
 from typing import Sequence, TypeAlias
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError as exc:
+    if exc.name != "torch":
+        raise
+
+    class _TorchRequired:
+        # Byte layouts and container framing have no tensor dependency. A dummy
+        # type keeps buffer dispatch valid; all numerical operations fail clearly.
+        class Tensor:
+            pass
+
+        def __getattr__(self, name):
+            raise ImportError("PyTorch is required for tensor codecs; byte-only artifact operations do not require it")
+
+    torch = _TorchRequired()
 
 from .numeric import (
     DirectFormat,
@@ -303,9 +318,9 @@ def encoded_size(
 
 
 _DIRECT_DTYPES = {
-    "BF16": torch.bfloat16,
-    "FP32": torch.float32,
-    "I32": torch.int32,
+    "BF16": "bfloat16",
+    "FP32": "float32",
+    "I32": "int32",
 }
 
 
@@ -315,7 +330,7 @@ def encode_direct(tensor: torch.Tensor, format: str | DirectFormat) -> bytes:
     spec = _format(format)
     if not isinstance(spec, DirectFormat):
         raise ValueError("direct encoding requires BF16, FP32, or I32")
-    expected_dtype = _DIRECT_DTYPES[spec.name]
+    expected_dtype = getattr(torch, _DIRECT_DTYPES[spec.name])
     if tensor.dtype != expected_dtype:
         raise TypeError(
             f"{spec.name} encoding requires {expected_dtype}, got {tensor.dtype}"
@@ -369,7 +384,7 @@ def decode_direct(
     raw = _payload_tensor(payload, target)
     if sys.byteorder != "little" and target.type == "cpu":
         raw = raw.reshape(-1, spec.word_bytes).flip(1).contiguous().reshape(-1)
-    return raw.view(_DIRECT_DTYPES[spec.name]).reshape(dims)
+    return raw.view(getattr(torch, _DIRECT_DTYPES[spec.name])).reshape(dims)
 
 
 def _exact_uint8_matrix(
@@ -453,13 +468,13 @@ def decode_fp8_row_scaled_words(
 def dequantize_fp8_row_scaled(
     payload: Payload,
     shape: Sequence[int],
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Reconstruct a row-scaled FP8 matrix from its exact stored words."""
 
     codes, scales = decode_fp8_row_scaled_words(payload, shape)
     return (codes.view(torch.float8_e4m3fn).float() * scales.float().unsqueeze(1)).to(
-        dtype
+        torch.float32 if dtype is None else dtype
     )
 
 
@@ -1033,7 +1048,7 @@ def dequantize_row_split(
     shape: Sequence[int],
     device: torch.device | str = "cpu",
     *,
-    dtype: torch.dtype = torch.bfloat16,
+    dtype: torch.dtype | None = None,
     compiled: bool = False,
 ) -> torch.Tensor:
     """Reconstruct a logical ``[N,K]`` tensor from a row-split payload."""
@@ -1041,6 +1056,8 @@ def dequantize_row_split(
     spec = _format(format)
     if not isinstance(spec, QuantFormat):
         raise ValueError("row-split dequantization requires a grouped quantized format")
+    if dtype is None:
+        dtype = torch.bfloat16
     if not dtype.is_floating_point:
         raise TypeError("dequantized output dtype must be floating point")
     geometry = row_split_geometry(spec, shape)

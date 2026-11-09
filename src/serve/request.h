@@ -51,6 +51,7 @@ enum class ContentKind {
     Text,
     Image,
     Video,
+    Document,
 };
 
 struct CacheBoundary {
@@ -69,7 +70,7 @@ struct CacheBoundary {
 
 struct ContentPart {
     ContentKind kind = ContentKind::Text;
-    std::string text;     // populated for Text
+    std::string text;     // Text content, or Document title/context metadata
     std::string type_raw; // original wire "type" string for diagnostics
     ninfer::product::media_acquire::Source source;
     ninfer::ImageResizePolicy image_resize_policy = ninfer::ImageResizePolicy::Downsize;

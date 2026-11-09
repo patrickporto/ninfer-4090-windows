@@ -3,6 +3,7 @@
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
 #include "core/arena.h"
+#include "targets/qwen3_6/impl/runtime/pipeline_execution.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -533,6 +534,13 @@ public:
     ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
                     DeviceContext& device, const StartupObserver& startup_observer);
     ~ProgramImplCore() noexcept;
+    void initialize_pipeline(const LoadedModelData& tail_model, const SequencePlanImpl& owner_plan,
+                             const SequencePlanImpl& tail_plan, DeviceContext& tail_device);
+    void initialize_tensor(const LoadedModelData& tail_model, const SequencePlanImpl& owner_plan,
+                           const SequencePlanImpl& tail_plan, DeviceContext& tail_device);
+    PipelineSequenceBinding& pipeline_binding(const SequenceState& sequence) const;
+    void release_pipeline_sequence(SequenceState& sequence, bool strict) noexcept;
+
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
@@ -658,6 +666,7 @@ public:
     const std::size_t graph_allowance_bytes;
     const WorkspacePlan workspace_plan;
 
+    std::unique_ptr<PipelineExecution> pipeline;
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
@@ -893,6 +902,7 @@ private:
         bool root_waiting_for_victim = false;
         std::array<StateImageHandle, 2> reserved_states{};
         std::size_t reserved_state_count = 0;
+        PipelineActivePreparation pipeline_preparation;
         std::optional<StateImageHandle> state_fork_destination;
         std::optional<KVAddressSpaceHandle> root_text_address;
         std::optional<KVAddressSpaceHandle> root_backend_address;

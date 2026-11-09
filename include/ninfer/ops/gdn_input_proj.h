@@ -25,6 +25,9 @@ namespace ninfer::ops {
  *   z [6144,T]. T may be any positive value. x, qkv, and z are contiguous BF16.
  *   qk_weight is Q4G64_F16S RowSplit [4096,5120] and value_z_weight is one
  *   Q5G64_F16S RowSplit parent [12288,5120] in [value,z] row order, both with FP16 scales.
+ *   The additional closed local profile has Q4 [2048,5120], Q5 [6144,5120], qkv [5120,T],
+ *   and z [3072,T]. Its Q4 rows are Q1024 then K1024; Q5 rows are V3072 then Z3072.
+ *   It admits AllowA8 only, with the same formula using the local half-parent boundaries.
  *
  * Numeric:
  *   The oracle exact-decodes both weight parents and evaluates all four logical projections

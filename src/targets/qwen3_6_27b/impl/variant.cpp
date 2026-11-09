@@ -10,6 +10,7 @@
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/silu_mul.h"
+#include "ninfer/ops/tensor_projection.h"
 
 #include <cstdlib>
 #include <algorithm>
@@ -338,6 +339,81 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                        workspace, stream);
     ops::linear_add(activation, weights.down, residual, body_policy(weights.down, phase), workspace,
                     stream);
+}
+
+namespace {
+constexpr std::int32_t kTensorIntermediate = TextConfig::intermediate / 2;
+
+template <class Payload, class Split>
+const Split& tensor_split_payload(const Payload& payload, const char* label) {
+    const auto* split = std::get_if<Split>(&payload);
+    if (split == nullptr) throw std::invalid_argument(label);
+    return *split;
+}
+} // namespace
+
+void Variant::tensor_attention_projection(const Tensor& hidden,
+                                          const FullAttentionProjectionWeights& weights,
+                                          Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
+                                          ops::LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
+    const auto& split = tensor_split_payload<FullAttentionProjectionWeights,
+                                             SplitAttentionProjectionPayload>(
+        weights, "TP2 attention projection requires split Q4/Q5 shards");
+    ops::attn_input_proj(hidden, split.query_key, split.gate_value, query, gate, key, value,
+                         policy, workspace, stream);
+}
+
+void Variant::tensor_gdn_input_projection(const Tensor& hidden,
+                                          const GdnProjectionWeights& weights, Tensor& qkv,
+                                          Tensor& output_gate, ops::LinearPolicy policy, WorkspaceArena& workspace,
+                                          cudaStream_t stream) {
+    const auto& split =
+        tensor_split_payload<GdnInputProjectionPayload, SplitGdnInputProjectionPayload>(
+            weights.input_projection, "TP2 GDN input projection requires split Q4/Q5 shards");
+    ops::gdn_input_proj(hidden, split.query_key, split.value_z, qkv, output_gate,
+                        policy, workspace, stream);
+}
+
+void Variant::tensor_post_mixer(const Tensor& hidden, const PostMixerWeights& weights,
+                                Tensor& partial, ops::LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
+    auto scope        = workspace.scope();
+    Tensor activation = workspace.alloc(DType::BF16, {kTensorIntermediate, hidden.ne[1]});
+    ops::linear_swiglu(hidden, weights.gate_up, activation, policy, workspace, stream);
+    ops::tensor_projection(activation, weights.down, partial, policy, workspace, stream);
+}
+
+std::size_t Variant::tensor_attention_projection_workspace_capacity_bytes(std::int32_t first,
+                                                                          std::int32_t last) {
+    validate_token_interval(first, last);
+    // The local profile shares the A8 activation staging of the registered parent profile.
+    return ops::attn_input_proj_workspace_capacity_bytes(TextConfig::hidden,
+                                                         ops::LinearPolicy::AllowA8, first, last);
+}
+
+std::size_t Variant::tensor_gdn_input_projection_workspace_capacity_bytes(std::int32_t first,
+                                                                          std::int32_t last) {
+    validate_token_interval(first, last);
+    return ops::gdn_input_proj_workspace_capacity_bytes(TextConfig::hidden,
+                                                        ops::LinearPolicy::AllowA8, first, last);
+}
+
+std::size_t Variant::tensor_post_mixer_workspace_capacity_bytes(std::int32_t first,
+                                                                std::int32_t last) {
+    validate_token_interval(first, last);
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {kTensorIntermediate, last});
+    {
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(ops::linear_swiglu_workspace_capacity_bytes(
+            QType::Q4G64_F16S, 2 * kTensorIntermediate, TextConfig::hidden,
+            ops::LinearPolicy::AllowA8, first, last));
+    }
+    {
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(
+            ops::tensor_projection_workspace_capacity_bytes(kTensorIntermediate, first, last));
+    }
+    return layout.peak_bytes(1);
 }
 
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,

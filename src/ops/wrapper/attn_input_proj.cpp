@@ -231,9 +231,16 @@ void dispatch_split_parent(const Tensor& x, const Weight& query_key_weight,
         throw std::invalid_argument("attn_input_proj: Q4/Q5 parents admit only A16 or A8");
     }
     constexpr std::int32_t kHidden = 5120;
-    constexpr std::int32_t kQRows  = 6144;
-    constexpr std::int32_t kKvRows = 1024;
-    const std::int32_t cols        = x.ne[1];
+    // The TP2 rank-local profile holds twelve query heads and two KV heads per parent.
+    const bool local = query_key_weight.n == 3584 && gate_value_weight.n == 3584;
+    if (local && policy != LinearPolicy::AllowA8 &&
+        !(policy == LinearPolicy::A16Only && x.ne[1] <= 12)) {
+        throw std::invalid_argument(
+            "attn_input_proj: local Q4/Q5 parents require AllowA8, or A16Only for T<=12");
+    }
+    const std::int32_t kQRows  = local ? 3072 : 6144;
+    const std::int32_t kKvRows = local ? 512 : 1024;
+    const std::int32_t cols    = x.ne[1];
     require_matrix(x, kHidden, cols, "x");
     require_matrix(q, kQRows, cols, "q");
     require_matrix(gate, kQRows, cols, "gate");

@@ -1,4 +1,5 @@
 #include "core/arena.h"
+#include "core/device.h"
 
 #include <cuda_runtime.h>
 
@@ -37,8 +38,9 @@ std::uintptr_t align_up_addr(std::uintptr_t addr, std::size_t align) {
     return with_mask & ~static_cast<std::uintptr_t>(mask);
 }
 
-void free_device(void*& ptr) noexcept {
+void free_device(void*& ptr, int device) noexcept {
     if (ptr != nullptr) {
+        ScopedDevice binding(device, std::nothrow);
         log_cuda_error("cudaFree", cudaFree(ptr));
         ptr = nullptr;
     }
@@ -54,6 +56,7 @@ void free_pinned(void*& ptr) noexcept {
 } // namespace
 
 DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
+    cuda_require(cudaGetDevice(&device_), "cudaGetDevice");
     if (bytes == 0) { return; }
 
     void* ptr             = nullptr;
@@ -64,9 +67,9 @@ DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     p = ptr;
 }
 
-DeviceBuffer::~DeviceBuffer() { free_device(p); }
+DeviceBuffer::~DeviceBuffer() { free_device(p, device_); }
 
-DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept : p(other.p), bytes(other.bytes) {
+DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept : p(other.p), bytes(other.bytes), device_(other.device_) {
     other.p     = nullptr;
     other.bytes = 0;
 }
@@ -74,7 +77,8 @@ DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept : p(other.p), bytes(ot
 DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
     if (this == &other) { return *this; }
 
-    free_device(p);
+    free_device(p, device_);
+    device_ = other.device_;
     p     = other.p;
     bytes = other.bytes;
 
@@ -84,6 +88,7 @@ DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
 }
 
 void DeviceBuffer::fill(int byte_value) {
+    ScopedDevice binding(device_);
     if (bytes == 0) { return; }
     const cudaError_t err = cudaMemset(p, byte_value, bytes);
     if (err != cudaSuccess) {
@@ -92,6 +97,7 @@ void DeviceBuffer::fill(int byte_value) {
 }
 
 void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::size_t byte_offset) {
+    ScopedDevice binding(device_);
     require_range(byte_offset, count, "host-to-device copy");
     if (count == 0) { return; }
     void* destination     = static_cast<std::uint8_t*>(p) + byte_offset;
@@ -110,6 +116,7 @@ void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::si
 
 void DeviceBuffer::copy_to_host(void* destination, std::size_t count,
                                 std::size_t byte_offset) const {
+    ScopedDevice binding(device_);
     require_range(byte_offset, count, "device-to-host copy");
     if (count == 0) { return; }
     const void* source    = static_cast<const std::uint8_t*>(p) + byte_offset;
@@ -139,6 +146,7 @@ DeviceArena::Scope::Scope(Scope&& other) noexcept
 }
 
 DeviceArena::DeviceArena(std::size_t capacity_bytes) {
+    cuda_require(cudaGetDevice(&device_), "cudaGetDevice");
     if (capacity_bytes == 0) {
         throw std::invalid_argument("DeviceArena capacity must be nonzero");
     }
@@ -159,14 +167,18 @@ DeviceArena::DeviceArena(DeviceSpan storage)
     if (base_ == nullptr || cap_ == 0) {
         throw std::invalid_argument("borrowed DeviceArena storage must be non-empty");
     }
+    cudaPointerAttributes attributes{};
+    cuda_require(cudaPointerGetAttributes(&attributes, base_), "cudaPointerGetAttributes");
+    if (attributes.type != cudaMemoryTypeDevice) throw std::invalid_argument("arena requires device storage");
+    device_ = attributes.device;
 }
 
 DeviceArena::~DeviceArena() {
-    if (owns_) { free_device(base_); }
+    if (owns_) { free_device(base_, device_); }
 }
 
 DeviceArena::DeviceArena(DeviceArena&& other) noexcept
-    : base_(other.base_), cap_(other.cap_), off_(other.off_), peak_(other.peak_),
+    : device_(other.device_), base_(other.base_), cap_(other.cap_), off_(other.off_), peak_(other.peak_),
       owns_(other.owns_) {
     other.base_ = nullptr;
     other.cap_  = 0;
@@ -178,7 +190,8 @@ DeviceArena::DeviceArena(DeviceArena&& other) noexcept
 DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
     if (this == &other) { return *this; }
 
-    if (owns_) { free_device(base_); }
+    if (owns_) { free_device(base_, device_); }
+    device_ = other.device_;
     base_ = other.base_;
     cap_  = other.cap_;
     off_  = other.off_;

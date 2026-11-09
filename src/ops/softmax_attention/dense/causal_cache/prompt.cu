@@ -6,6 +6,7 @@
 #include "ops/kv_cache/append/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_bf16.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8.cuh"
+#include "core/cuda_function_config.h"
 #include "core/device.h" // CUDA_CHECK
 
 #include <cstdint>
@@ -21,10 +22,8 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
     // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
-    static const cudaError_t attr_bf16 =
-        cudaFuncSetAttribute(causal_attention_prompt_bf16_kernel<Geometry, Metadata>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptSmemBytes);
-    CUDA_CHECK(attr_bf16);
+    configure_cuda_shared_memory(causal_attention_prompt_bf16_kernel<Geometry, Metadata>,
+                                 kCausalPromptSmemBytes);
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     if (kv_storage_is_int8_family(cache.storage)) {
@@ -33,13 +32,12 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         const Tensor& cache_k_scale = cache.k_scale_pages;
         const Tensor& cache_v_scale = cache.v_scale_pages;
-        const auto launch_i8 = [&]<bool PackedV, bool RotateK, bool RotateV, bool PackedK,
-                                   bool E8Root>() {
-            static const cudaError_t attr_i8 = cudaFuncSetAttribute(
+        const auto launch_i8        = [&]<bool PackedV, bool RotateK, bool RotateV, bool PackedK,
+                                          bool E8Root>() {
+            configure_cuda_shared_memory(
                 causal_attention_prompt_i8_kernel<Geometry, PackedV, RotateK, RotateV, PackedK,
                                                   E8Root, Metadata>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
-            CUDA_CHECK(attr_i8);
+                kCausalPromptI8SmemBytes);
             causal_attention_prompt_i8_kernel<Geometry, PackedV, RotateK, RotateV, PackedK, E8Root,
                                               Metadata>
                 <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
@@ -51,7 +49,10 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
                     static_cast<const std::int32_t*>(positions.data), scale,
                     static_cast<__nv_bfloat16*>(out.data), tokens);
         };
-        if (mode.e8_root) {
+        if constexpr (Geometry::QHeads == CausalD256H12Kv2::QHeads) {
+            // The local group-six profile registers only RK4V4-E8 in this branch.
+            launch_i8.template operator()<true, true, true, true, false>();
+        } else if (mode.e8_root) {
             launch_i8.template operator()<true, true, true, false, true>();
         } else if (mode.packed_k) {
             launch_i8.template operator()<true, true, true, true, false>();
@@ -98,6 +99,11 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
         return;
     }
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
+    if (q.ne[1] == CausalD256H12Kv2::QHeads) {
+        causal_attention_prompt_attention_launch_for<CausalD256H12Kv2>(q, positions, scale, cache,
+                                                                       metadata, out, stream);
+        return;
+    }
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(q, positions, scale, cache,
                                                                        metadata, out, stream);
@@ -135,6 +141,11 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
         };
+        if (q.ne[1] == CausalD256H12Kv2::QHeads) {
+            causal_attention_prompt_attention_launch_for<CausalD256H12Kv2>(
+                q, positions, scale, cache, metadata, out, stream);
+            return;
+        }
         if (q.ne[1] == CausalD256H24Kv4::QHeads) {
             causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(
                 q, positions, scale, cache, metadata, out, stream);

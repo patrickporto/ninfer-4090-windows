@@ -1,16 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 
-# The current implementation is compiled only for sm_89. Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
-# host-toolchain default or accepts an unsupported target.
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to build")
-endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "89")
-  message(FATAL_ERROR
-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=89; got "
-    "'${CMAKE_CUDA_ARCHITECTURES}'")
-endif()
+# Set and validate before CUDA compiler detection to avoid generic defaults.
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/ValidateCudaArchitectures.cmake)
 
 project(ninfer LANGUAGES C CXX CUDA)
 
@@ -20,6 +11,8 @@ include(FetchContent)
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+option(NINFER_ENABLE_NCCL "Build the optional tensor-parallel collective backend" OFF)
+set(NINFER_NCCL_ROOT "" CACHE PATH "NCCL prefix containing include/ and lib/")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -68,6 +61,21 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
+if(NINFER_ENABLE_NCCL)
+  if(WIN32)
+    message(FATAL_ERROR "The NCCL tensor-parallel backend requires Linux")
+  endif()
+  find_path(NINFER_NCCL_INCLUDE_DIR nccl.h HINTS "${NINFER_NCCL_ROOT}/include")
+  find_library(NINFER_NCCL_LIBRARY NAMES nccl libnccl.so.2
+    HINTS "${NINFER_NCCL_ROOT}/lib" "${NINFER_NCCL_ROOT}/lib64")
+  if(NOT NINFER_NCCL_INCLUDE_DIR OR NOT NINFER_NCCL_LIBRARY)
+    message(FATAL_ERROR "NCCL requested but not found; set NINFER_NCCL_ROOT to its local prefix")
+  endif()
+  add_library(ninfer_nccl UNKNOWN IMPORTED)
+  set_target_properties(ninfer_nccl PROPERTIES
+    IMPORTED_LOCATION "${NINFER_NCCL_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${NINFER_NCCL_INCLUDE_DIR}")
+endif()
 if(WIN32)
   set(NINFER_CUDART_TARGET CUDA::cudart_static)
 else()

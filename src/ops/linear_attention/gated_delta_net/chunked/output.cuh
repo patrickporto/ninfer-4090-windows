@@ -29,7 +29,6 @@ using ninfer::ops::exp2_approx;
 using ninfer::ops::ldmatrix_x2;
 using ninfer::ops::ldmatrix_x4;
 using ninfer::ops::mma_bf16;
-using ninfer::ops::mma_tf32;
 using ninfer::ops::smem_addr;
 
 static_assert(kChunkSize == 64,
@@ -142,7 +141,7 @@ __device__ __forceinline__ void mma_av_panel(float (&D)[N_TILES][4],
             const int col  = nt * MMA_N + lane_g;
             const float b0 = __bfloat162float(*V.ptr(k_off + lane_t, col));
             const float b1 = __bfloat162float(*V.ptr(k_off + lane_t + 4, col));
-            mma_tf32(D[nt][0], D[nt][1], D[nt][2], D[nt][3], a0, a1, a2, a3, b0, b1);
+            mma_tf32_rounded(D[nt][0], D[nt][1], D[nt][2], D[nt][3], a0, a1, a2, a3, b0, b1);
         }
     }
 }

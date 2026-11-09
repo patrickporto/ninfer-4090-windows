@@ -1,5 +1,6 @@
 #include "corpus.h"
 #include "evaluation.h"
+#include "kv_storage.h"
 
 #include "ninfer/engine.h"
 #include "product/logging/logging.h"
@@ -37,6 +38,7 @@ using json  = nlohmann::json;
 using ninfer::perplexity::CorpusSelection;
 using ninfer::perplexity::ScoreAggregate;
 using ninfer::perplexity::WindowPlan;
+using ninfer::perplexity::kv_name;
 
 struct Options {
     bool help_requested = false;
@@ -44,6 +46,7 @@ struct Options {
     std::optional<std::filesystem::path> corpus;
     std::optional<std::filesystem::path> text;
     std::optional<std::filesystem::path> output;
+    std::optional<std::filesystem::path> token_nll;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
     int device                          = 0;
@@ -56,7 +59,9 @@ std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8]\n"
+           "       [--output <directory>]\n"
+           "       [--token-nll <file.jsonl>]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -102,22 +107,11 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--device") {
             out.device = parse_integer<int>(value("--device"), "device");
         } else if (option == "--kv-dtype") {
-            const std::string_view dtype = value("--kv-dtype");
-            if (dtype == "bf16") {
-                out.kv = ninfer::KvCacheStorage::BFloat16;
-            } else if (dtype == "int8") {
-                out.kv = ninfer::KvCacheStorage::Int8Group64;
-            } else if (dtype == "fp8") {
-                out.kv = ninfer::KvCacheStorage::Fp8E4M3Row256;
-            } else if (dtype == "nvfp4") {
-                out.kv = ninfer::KvCacheStorage::Nvfp4Group16;
-            } else if (dtype == "k8v4") {
-                out.kv = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
-            } else {
-                usage_error("--kv-dtype must be bf16, int8, fp8, nvfp4, or k8v4");
-            }
+            out.kv = ninfer::perplexity::parse_kv_storage(value("--kv-dtype"));
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
+        } else if (option == "--token-nll") {
+            out.token_nll = std::filesystem::path(value("--token-nll"));
         } else if (option == "--log-level") {
             out.log_level = ninfer::product::parse_log_level(value("--log-level"));
         } else {
@@ -132,22 +126,6 @@ Options parse_options(int argc, char** argv) {
         usage_error("context/stride must satisfy context>=2 and 1<=stride<context");
     }
     return out;
-}
-
-std::string kv_name(ninfer::KvCacheStorage value) {
-    switch (value) {
-    case ninfer::KvCacheStorage::BFloat16:
-        return "bf16";
-    case ninfer::KvCacheStorage::Int8Group64:
-        return "int8-g64";
-    case ninfer::KvCacheStorage::Fp8E4M3Row256:
-        return "fp8-e4m3-r256";
-    case ninfer::KvCacheStorage::Nvfp4Group16:
-        return "nvfp4";
-    case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
-        return "k8v4";
-    }
-    throw std::logic_error("unknown KV dtype");
 }
 
 std::string safe_component(std::string_view value) {
@@ -257,7 +235,26 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                  ninfer::product::format_pretty_duration(preflight_seconds));
 
     const std::filesystem::path output_directory = prepare_output_directory(options, load, corpus);
-    const Clock::time_point scoring_started      = Clock::now();
+    std::ofstream token_nll;
+    if (options.token_nll) {
+        std::vector<std::filesystem::path> protected_paths{options.artifact, corpus.source,
+                                                           output_directory / "report.json",
+                                                           output_directory / "report.json.tmp"};
+        // Manifest streams retain paths relative to the manifest; custom-text streams use an
+        // absolute path. Resolve both before protecting the actual files that supplied tokens.
+        for (const auto& stream : streams) {
+            protected_paths.push_back(stream.source.path.is_absolute()
+                                          ? stream.source.path
+                                          : corpus.source.parent_path() / stream.source.path);
+        }
+        ninfer::perplexity::validate_token_nll_destination(*options.token_nll, protected_paths);
+        token_nll.open(*options.token_nll, std::ios::binary | std::ios::trunc);
+        if (!token_nll) {
+            throw std::runtime_error("cannot create per-token NLL output: " +
+                                     options.token_nll->string());
+        }
+    }
+    const Clock::time_point scoring_started = Clock::now();
     logger->info("scoring | {} streams | {} tokens | {} windows",
                  ninfer::product::format_pretty_count(streams.size()),
                  ninfer::product::format_pretty_count(total_scored_tokens),
@@ -303,6 +300,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
             }
             ScoreAggregate window_score;
             window_score.add(logprobs);
+            if (token_nll.is_open()) {
+                ninfer::perplexity::write_token_nll(token_nll, stream.source.id, window, logprobs);
+            }
             stream_score.add(window_score);
             overall.add(window_score);
             domains[stream.source.domain].add(window_score);
@@ -355,6 +355,12 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         stream_reports.push_back(std::move(stream_report));
     }
 
+    if (token_nll.is_open()) {
+        token_nll.flush();
+        if (!token_nll) { throw std::runtime_error("cannot flush per-token NLL output"); }
+        token_nll.close();
+        if (!token_nll) { throw std::runtime_error("cannot close per-token NLL output"); }
+    }
     const double scoring_seconds = seconds_since(scoring_started);
     progress->clear();
     logger->info("scoring complete | {} tokens | {} windows | PPL {:.6g} | {} | {}",

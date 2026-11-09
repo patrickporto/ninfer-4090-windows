@@ -5,6 +5,7 @@
 #include <ninfer/targets/qwen3_6/frontend.h>
 #include <ninfer/targets/qwen3_6/runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string_view>
@@ -15,6 +16,7 @@ struct DeviceContext;
 
 namespace artifact {
 class Binder;
+class Reader;
 class MaterializedArtifact;
 struct ArtifactIdentity;
 struct MaterializationPlan;
@@ -126,16 +128,33 @@ struct Package {
     [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);
     [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,
                                             WeightsProfile weights_profile);
+    [[nodiscard]] static std::array<LoadPlan, 2> plan_pipeline_load(
+        artifact::Binder& binder, const EngineOptions& options, WeightsProfile weights_profile);
+    // Strict whole-file TP2 binding of qwen3.8-27b/groupwise-int-tp2 into two rank plans.
+    [[nodiscard]] static std::array<LoadPlan, 2> plan_tensor_load(const artifact::Reader& reader,
+                                                                  const EngineOptions& options);
     [[nodiscard]] static std::unique_ptr<LoadedModel>
     construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
     [[nodiscard]] static Frontend make_frontend(const LoadedModel& model,
                                                 const EngineOptions& options);
     [[nodiscard]] static SequencePlanner make_sequence_planner(DeviceContext& device,
                                                                const EngineOptions& options,
-                                                               WeightsProfile weights_profile);
+                                                               WeightsProfile weights_profile,
+                                                               std::optional<PhysicalLayerRange> pipeline_layers = std::nullopt,
+                                                               std::optional<std::uint32_t> tensor_rank = std::nullopt);
     [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device,
                    const StartupObserver& startup_observer);
+    [[nodiscard]] static std::unique_ptr<Program> create_pipeline_program(
+        const LoadedModel& owner_model, const LoadedModel& tail_model,
+        SequencePlan&& owner_plan, SequencePlan&& tail_plan,
+        DeviceContext& owner_device, DeviceContext& tail_device,
+        const StartupObserver& startup_observer);
+    [[nodiscard]] static std::unique_ptr<Program> create_tensor_program(
+        const LoadedModel& owner_model, const LoadedModel& tail_model,
+        SequencePlan&& owner_plan, SequencePlan&& tail_plan,
+        DeviceContext& owner_device, DeviceContext& tail_device,
+        const StartupObserver& startup_observer);
 };
 
 } // namespace targets::qwen3_6_27b

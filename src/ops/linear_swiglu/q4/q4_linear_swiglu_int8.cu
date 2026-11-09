@@ -5,6 +5,7 @@
 #include "ops/common/act_quant_g64.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_int8_gemm.cuh"
 
+#include "core/cuda_function_config.h"
 #include "core/device.h"
 #include "ops/common/math.h"
 
@@ -22,13 +23,7 @@ using Int8ShortCfg = Q4Int8SwiGluSchedule<32, 128, 16, 64, 3, 2>;
 template <class Cfg, bool Full>
 void launch_folded_int8(const std::int8_t* xq, const float* xs, const Weight& weight, Tensor& out,
                         std::int32_t tokens, std::int32_t padded_k, cudaStream_t stream) {
-    static const bool configured = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(q4_linear_swiglu_int8_gemm_kernel<Cfg, Full>,
-                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        Cfg::kSharedBytes));
-        return true;
-    }();
-    (void)configured;
+    configure_cuda_shared_memory(q4_linear_swiglu_int8_gemm_kernel<Cfg, Full>, Cfg::kSharedBytes);
 
     const dim3 grid(static_cast<unsigned>(div_up(out.ne[0], Cfg::kPairRows)),
                     static_cast<unsigned>(div_up(tokens, Cfg::kBlockCols)));

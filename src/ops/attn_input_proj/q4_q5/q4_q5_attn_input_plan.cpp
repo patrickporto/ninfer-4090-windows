@@ -32,6 +32,12 @@ bool supported_shape(const Q4Q5AttnInputProblem& problem) noexcept {
            problem.padded_k == 5120;
 }
 
+// TP2 rank-local parents [3584,5120]: twelve complete query heads then two KV heads.
+bool supported_local_shape(const Q4Q5AttnInputProblem& problem) noexcept {
+    return problem.input_rows == 5120 && problem.query_rows == 3072 && problem.kv_rows == 512 &&
+           problem.padded_k == 5120;
+}
+
 } // namespace
 
 const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noexcept {
@@ -53,7 +59,7 @@ const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noe
 }
 
 bool q4_q5_attn_input_admits(const Q4Q5AttnInputProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1;
+    return (supported_shape(problem) || supported_local_shape(problem)) && problem.cols >= 1;
 }
 
 Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& problem,
@@ -61,6 +67,12 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
     if (!q4_q5_attn_input_admits(problem)) {
         throw std::invalid_argument(
             "Q4/Q5 attention input: exact problem or column count is not admitted");
+    }
+    // Local geometry: A8 at every extent (prefill) or the A16 ParentSplitFixed decode route.
+    if (supported_local_shape(problem) && policy != LinearPolicy::AllowA8 &&
+        !(policy == LinearPolicy::A16Only && problem.cols <= 12)) {
+        throw std::invalid_argument(
+            "Q4/Q5 attention input: local geometry requires AllowA8, or A16Only for T<=12");
     }
 
     // AllowA8 (prefill) uses group-64 INT8 activations at every token extent, so prefix reuse

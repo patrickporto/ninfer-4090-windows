@@ -18,8 +18,10 @@ namespace ninfer::ops::detail {
 namespace {
 
 constexpr int kN                 = 34816;
+constexpr int kLocalN            = 17408; // TP2 rank-local gate/up [8704 gate | 8704 up]
 constexpr int kK                 = 5120;
 constexpr int kIntermediate      = kN / 2;
+constexpr int kLocalIntermediate = kLocalN / 2;
 constexpr int kGroupK            = 64;
 constexpr int kGroups            = kK / kGroupK;
 constexpr int kBytesPerGroup     = 32;
@@ -31,7 +33,8 @@ constexpr int kBlockThreads      = kWarpsPerBlock * 32;
 constexpr int kPairsPerBlock     = kWarpsPerBlock;
 constexpr int kXVecs             = kK / 8; // x as uint4 (8 bf16 each)
 constexpr int kTiles             = kGroups / kGroupsPerWarpTile;
-static_assert(kIntermediate % kPairsPerBlock == 0);
+static_assert(kIntermediate % kPairsPerBlock == 0 && kLocalIntermediate % kPairsPerBlock == 0);
+static_assert(kLocalIntermediate % 8 == 0);
 static_assert(kBytesPerGroup == 2 * kVecBytes);
 static_assert(kGroups % kGroupsPerWarpTile == 0);
 static_assert(kVecsPerWarpTile == 32);
@@ -41,14 +44,16 @@ struct Q4SwiGluSmallTGeometry {
     static constexpr int kGroupsPerRow = kK / kGroupK;
 };
 
+template <int I>
 struct Q4SwiGluSmallTRows {
     static constexpr int kOutputRowsPerCta = 8;
 
     __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
-        return output_row0 + (local_row & 7) + (local_row >= 8 ? kIntermediate : 0);
+        return output_row0 + (local_row & 7) + (local_row >= 8 ? I : 0);
     }
 };
 
+template <int I>
 struct Q4SwiGluSmallTEpilogue {
     __nv_bfloat16* out;
     int columns;
@@ -56,11 +61,11 @@ struct Q4SwiGluSmallTEpilogue {
     template <int ActiveCols>
     __device__ __forceinline__ void store(int row, int col0, float4 projected) const {
         if (col0 < columns) {
-            out[static_cast<std::int64_t>(col0) * kIntermediate + row] =
+            out[static_cast<std::int64_t>(col0) * I + row] =
                 __float2bfloat16_rn(silu(projected.x) * projected.z);
         }
         if (col0 + 1 < columns) {
-            out[static_cast<std::int64_t>(col0 + 1) * kIntermediate + row] =
+            out[static_cast<std::int64_t>(col0 + 1) * I + row] =
                 __float2bfloat16_rn(silu(projected.y) * projected.w);
         }
     }
@@ -68,28 +73,30 @@ struct Q4SwiGluSmallTEpilogue {
 
 using SmallTLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-template <int ActiveCols>
+template <int ActiveCols, int I>
 void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
-    constexpr int kBlocks = kIntermediate / Q4SwiGluSmallTRows::kOutputRowsPerCta;
-    const Q4SwiGluSmallTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), x.ne[1]};
-    q4_small_t_mma_kernel<Q4SwiGluSmallTGeometry, TileCols, ActiveCols, Q4SwiGluSmallTEpilogue,
-                          Q4SwiGluSmallTRows, true>
+    constexpr int kBlocks = I / Q4SwiGluSmallTRows<I>::kOutputRowsPerCta;
+    const Q4SwiGluSmallTEpilogue<I> epilogue{static_cast<__nv_bfloat16*>(out.data), x.ne[1]};
+    q4_small_t_mma_kernel<Q4SwiGluSmallTGeometry, TileCols, ActiveCols, Q4SwiGluSmallTEpilogue<I>,
+                          Q4SwiGluSmallTRows<I>, true>
         <<<kBlocks, Q4DraftSmallTSchedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
-            epilogue, Q4SwiGluSmallTRows{}, x.ne[1]);
+            epilogue, Q4SwiGluSmallTRows<I>{}, x.ne[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <std::size_t... Offsets>
+template <int I, std::size_t... Offsets>
 constexpr auto make_small_t_launchers(std::index_sequence<Offsets...>) {
     return std::array<SmallTLauncher, sizeof...(Offsets)>{
-        &launch_small_t_active<8 * (1 + static_cast<int>(Offsets))>...};
+        &launch_small_t_active<8 * (1 + static_cast<int>(Offsets)), I>...};
 }
 
-constexpr auto kSmallTLaunchers = make_small_t_launchers(std::make_index_sequence<4>{});
+constexpr auto kSmallTLaunchers = make_small_t_launchers<kIntermediate>(std::make_index_sequence<4>{});
+constexpr auto kLocalSmallTLaunchers =
+    make_small_t_launchers<kLocalIntermediate>(std::make_index_sequence<4>{});
 
 __device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[kVecsPerWarpTile],
                                                    uint4 (*__restrict__ s_scale)[2],
@@ -112,6 +119,7 @@ __device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[
     pipe_commit();
 }
 
+template <int I>
 __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restrict__ x,
                                                   const std::uint8_t* __restrict__ codes,
                                                   const std::uint8_t* __restrict__ scales,
@@ -137,9 +145,9 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
         codes + static_cast<std::int64_t>(out_row) * kGroups * kBytesPerGroup;
     const std::uint8_t* gate_scale_row = scales + static_cast<std::int64_t>(out_row) * kGroups * 2;
     const std::uint8_t* up_code_row =
-        codes + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * kBytesPerGroup;
+        codes + static_cast<std::int64_t>(out_row + I) * kGroups * kBytesPerGroup;
     const std::uint8_t* up_scale_row =
-        scales + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * 2;
+        scales + static_cast<std::int64_t>(out_row + I) * kGroups * 2;
     const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x_sh);
 
     float gate_acc = 0.0f;
@@ -205,13 +213,21 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
 
 void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
                                        cudaStream_t stream) {
-    if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
-        throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
+    if ((w.n != kN && w.n != kLocalN) || w.k != kK || w.padded_shape[1] != kK ||
+        out.ne[0] != w.n / 2) {
+        throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816|17408,5120]");
     }
-    const int grid = kIntermediate / kPairsPerBlock;
-    q4_linear_swiglu_gemv_pair_kernel<<<grid, kBlockThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
+    const auto* xp = static_cast<const __nv_bfloat16*>(x.data);
+    const auto* qp = static_cast<const std::uint8_t*>(w.qdata);
+    const auto* sp = static_cast<const std::uint8_t*>(w.scales);
+    auto* op       = static_cast<__nv_bfloat16*>(out.data);
+    if (w.n == kN) {
+        q4_linear_swiglu_gemv_pair_kernel<kIntermediate>
+            <<<kIntermediate / kPairsPerBlock, kBlockThreads, 0, stream>>>(xp, qp, sp, op);
+    } else {
+        q4_linear_swiglu_gemv_pair_kernel<kLocalIntermediate>
+            <<<kLocalIntermediate / kPairsPerBlock, kBlockThreads, 0, stream>>>(xp, qp, sp, op);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -220,7 +236,11 @@ void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Ten
     if (x.ne[1] < 2 || x.ne[1] > 32) {
         throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
     }
-    kSmallTLaunchers[static_cast<std::size_t>((x.ne[1] - 1) / 8)](x, w, out, stream);
+    if ((w.n != kN && w.n != kLocalN) || w.k != kK || out.ne[0] != w.n / 2) {
+        throw std::invalid_argument("Q4 LinearSwiGLU small-T requires weight [34816|17408,5120]");
+    }
+    const auto index = static_cast<std::size_t>((x.ne[1] - 1) / 8);
+    (w.n == kN ? kSmallTLaunchers : kLocalSmallTLaunchers)[index](x, w, out, stream);
 }
 
 } // namespace ninfer::ops::detail

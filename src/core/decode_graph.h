@@ -22,6 +22,7 @@ public:
 
 private:
     friend class DecodeGraphExecutable;
+    int device_ = 0;
     cudaGraph_t graph_ = nullptr;
 };
 
@@ -43,6 +44,7 @@ public:
     void reset() noexcept;
 
 private:
+    int device_ = 0;
     cudaGraphExec_t exec_ = nullptr;
 };
 
