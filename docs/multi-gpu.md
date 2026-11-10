@@ -49,3 +49,19 @@ PP2 must match Single in aggregate NLL (mean |dNLL| <= 0.01) and in greedy gener
 margin-certified fixtures. TP2 changes the kernel route of most ops from layer 0, so it is held
 to Single's own route-change envelope (Single A16 vs Single A8 on the same fixture) and may not
 regress aggregate NLL. See `tests/parallel/`.
+
+## Second GPU as context-cache tier
+
+In Single placement an idle second GPU can hold the context cache's Host tier (Host
+StateImages and Host KV) instead of pinned RAM:
+
+```bash
+CUDA_VISIBLE_DEVICES=<4090>,<5070ti> ninfer-serve model.ninfer --host-tier-device 1 \
+    --host-kv-mib 8192 --host-state-slots 8 ...
+```
+
+Demotion and restore copies use `cudaMemcpyDefault`, so they work without P2P (the driver stages
+through host memory). Measured on RTX 4090 + RTX 5070 Ti: tier-to-compute copies run at
+12.3 GB/s versus 13.4 GB/s from pinned RAM, and resuming a 7.2K-token conversation from the tier
+takes 0.46-0.54 s versus 2.5 s of re-prefill. Greedy outputs and cache hits match the pinned tier
+(`--host-tier-device` requires Single placement and a device other than `--device`).

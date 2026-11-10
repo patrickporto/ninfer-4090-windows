@@ -265,7 +265,8 @@ public:
             return std::nullopt;
         }
         Object& object = require(*handle);
-        std::memcpy(host_->writable_view(*slot).data, source.data, source.layout->image_bytes);
+        // The Host tier may live in another device's VRAM; UVA copies serve both residencies.
+        copy_tier_bytes(host_->writable_view(*slot).data, source.data, source.layout->image_bytes);
         object.host_slot     = *slot;
         object.content_epoch = next_epoch();
         return handle;

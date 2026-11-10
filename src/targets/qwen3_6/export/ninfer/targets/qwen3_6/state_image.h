@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/cache_tier.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
@@ -70,11 +71,12 @@ struct HostStateSlotHandle {
     std::uint32_t generation = 0;
 };
 
-/** Fixed-capacity pinned storage for complete physical StateImage payloads; owns no cache policy.
+/** Fixed-capacity cache-tier storage for complete physical StateImage payloads; owns no cache policy.
  */
 class HostStatePool {
 public:
-    HostStatePool(StateImageHostLayout layout, std::uint32_t capacity);
+    // tier_device < 0 backs the pool with pinned host memory; otherwise with that device's VRAM.
+    HostStatePool(StateImageHostLayout layout, std::uint32_t capacity, int tier_device = -1);
 
     HostStatePool(const HostStatePool&)            = delete;
     HostStatePool& operator=(const HostStatePool&) = delete;
@@ -103,7 +105,7 @@ private:
     [[nodiscard]] std::byte* slot_data(std::uint32_t index) const noexcept;
 
     StateImageHostLayout layout_;
-    std::optional<PinnedHostBuffer> backing_;
+    std::optional<CacheTierBuffer> backing_;
     std::vector<Slot> slots_;
     std::vector<std::uint32_t> free_slots_;
     std::uint32_t free_count_ = 0;

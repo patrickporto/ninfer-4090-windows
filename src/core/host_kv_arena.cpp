@@ -209,8 +209,8 @@ void HostKVAllocation::disarm() noexcept {
 }
 
 HostKVArena::HostKVArena(std::size_t capacity_bytes,
-                         std::span<const HostKVPageLayout> supported_layouts)
-    : capacity_bytes_(capacity_bytes),
+                         std::span<const HostKVPageLayout> supported_layouts, int tier_device)
+    : tier_device_(tier_device < 0 ? -1 : tier_device), capacity_bytes_(capacity_bytes),
       layouts_(supported_layouts.begin(), supported_layouts.end()) {
     for (std::size_t index = 0; index < layouts_.size(); ++index) {
         const HostKVPageLayout planned = plan_host_kv_page_layout(layouts_[index].geometry);
@@ -228,7 +228,7 @@ HostKVArena::HostKVArena(std::size_t capacity_bytes,
         throw std::invalid_argument("Non-empty Host KV arena requires supported page layouts");
     }
 
-    backing_.emplace(capacity_bytes_);
+    backing_.emplace(capacity_bytes_, tier_device_);
     const auto smallest = std::min_element(
         layouts_.begin(), layouts_.end(), [](const HostKVPageLayout& a, const HostKVPageLayout& b) {
             return a.page_stride < b.page_stride;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/cache_tier.h"
 #include "core/paged_kv_cache.h"
 #include "core/transfer_work.h"
 
@@ -194,7 +195,9 @@ private:
 
 class HostKVArena {
 public:
-    HostKVArena(std::size_t capacity_bytes, std::span<const HostKVPageLayout> supported_layouts);
+    // tier_device < 0 backs the arena with pinned host memory; otherwise with that device's VRAM.
+    HostKVArena(std::size_t capacity_bytes, std::span<const HostKVPageLayout> supported_layouts,
+                int tier_device = -1);
 
     HostKVArena(const HostKVArena&)            = delete;
     HostKVArena& operator=(const HostKVArena&) = delete;
@@ -265,7 +268,8 @@ private:
     [[nodiscard]] std::byte* allocation_data(const Descriptor& descriptor) const noexcept;
     void bump_revision() noexcept;
 
-    std::optional<PinnedHostBuffer> backing_;
+    std::optional<CacheTierBuffer> backing_;
+    int tier_device_ = -1;
     std::size_t capacity_bytes_ = 0;
     std::size_t occupied_bytes_ = 0;
     std::vector<HostKVPageLayout> layouts_;

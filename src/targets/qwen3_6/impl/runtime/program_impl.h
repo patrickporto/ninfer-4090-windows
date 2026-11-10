@@ -855,7 +855,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         StartupPhaseScope host_state_phase(startup_observer, StartupPhase::HostStatePin,
                                            StartupProgressUnit::Bytes, host_state_bytes);
         host_state_images = std::make_unique<qwen3_6::HostStatePool>(
-            state_images->host_layout(), plan.context_cache.host_state_slots);
+            state_images->host_layout(), plan.context_cache.host_state_slots,
+            plan.context_cache.host_tier_device.value_or(-1));
         host_state_phase.complete(host_state_bytes, host_state_bytes);
     }
     const std::uint64_t logical_state_capacity =
@@ -921,7 +922,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
         host_kv_arena = std::make_unique<HostKVArena>(
             plan.context_cache.host_kv_capacity_bytes,
-            std::span<const HostKVPageLayout>(layouts.data(), layouts.size()));
+            std::span<const HostKVPageLayout>(layouts.data(), layouts.size()),
+            plan.context_cache.host_tier_device.value_or(-1));
         host_kv_phase.complete(
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes),
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));

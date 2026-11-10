@@ -539,7 +539,7 @@ ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
         std::uint8_t* const image_out = base + state_offset + index * state_layout.image_bytes;
         if (state_store->residency(image) == StateReplicaResidency::HostOnly) {
             const qwen3_6::HostStateImageConstView view = state_store->host_view(image);
-            std::memcpy(image_out, view.data, state_layout.image_bytes);
+            copy_tier_bytes(image_out, view.data, state_layout.image_bytes);
         } else {
             state_images->copy_to_host(
                 state_store->physical_slot(image),
@@ -593,7 +593,7 @@ ProgramImplCore::save_continuation(const ContinuationHandle& continuation,
                     replica.page_offset >= view.page_count()) {
                     throw std::logic_error("retained session Host replica layout is inconsistent");
                 }
-                std::memcpy(base + payload_offset +
+                copy_tier_bytes(base + payload_offset +
                                 static_cast<std::size_t>(page) * layout.page_stride,
                             view.data() +
                                 static_cast<std::size_t>(replica.page_offset) * layout.page_stride,

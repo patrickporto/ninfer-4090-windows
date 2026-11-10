@@ -19,6 +19,7 @@ endfunction()
 # Device/tensor/layout/graph primitives and the model-independent request runtime.
 add_library(ninfer_core STATIC
   core/arena.cu
+  core/cache_tier.cpp
   core/device.cu
   core/device_group.cpp
   core/tensor_collective.cpp

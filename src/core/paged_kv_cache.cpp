@@ -605,7 +605,7 @@ void DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> source,
                 CUDA_CHECK(cudaMemcpy2DAsync(
                     host_base, host.page_stride,
                     device_base + static_cast<std::int64_t>(first) * plane.nb[3], plane.nb[3],
-                    host_plane.page_payload_bytes, count, cudaMemcpyDeviceToHost, stream));
+                    host_plane.page_payload_bytes, count, cudaMemcpyDefault, stream));
             } else {
                 for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
                     CUDA_CHECK(cudaMemcpy2DAsync(
@@ -613,7 +613,7 @@ void DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> source,
                         host.page_stride,
                         device_base + static_cast<std::int64_t>(head) * plane.nb[3] +
                             static_cast<std::int64_t>(first) * plane.nb[2],
-                        plane.nb[2], host_plane.head_payload_bytes, count, cudaMemcpyDeviceToHost,
+                        plane.nb[2], host_plane.head_payload_bytes, count, cudaMemcpyDefault,
                         stream));
                 }
             }
@@ -658,7 +658,7 @@ void DeviceKVPagePool::copy_from_host(const std::byte* source, const HostKVPageL
                 CUDA_CHECK(cudaMemcpy2DAsync(
                     device_base + static_cast<std::int64_t>(first) * plane.nb[3], plane.nb[3],
                     host_base, host.page_stride, host_plane.page_payload_bytes, count,
-                    cudaMemcpyHostToDevice, stream));
+                    cudaMemcpyDefault, stream));
             } else {
                 for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
                     CUDA_CHECK(cudaMemcpy2DAsync(
@@ -667,7 +667,7 @@ void DeviceKVPagePool::copy_from_host(const std::byte* source, const HostKVPageL
                         plane.nb[2],
                         host_base + static_cast<std::size_t>(head) * host_plane.head_payload_bytes,
                         host.page_stride, host_plane.head_payload_bytes, count,
-                        cudaMemcpyHostToDevice, stream));
+                        cudaMemcpyDefault, stream));
                 }
             }
         }

@@ -153,6 +153,9 @@ struct ContextCacheOptions {
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
+    // CUDA ordinal whose VRAM backs both Host tiers instead of pinned host memory. It must be
+    // idle: distinct from EngineOptions::device and from every placement rank.
+    std::optional<int> host_tier_device;
     // Bounded private/shared logical catalogs and per-continuation long-anchor count.
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;

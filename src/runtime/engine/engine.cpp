@@ -78,6 +78,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         cache.device_state_slots                = 0;
         cache.host_state_slots                  = 0;
         cache.host_kv_capacity_bytes            = 0;
+        cache.host_tier_device.reset();
         cache.max_private_continuations         = concurrency;
         cache.max_shared_prefixes               = 0;
         cache.max_long_anchors_per_continuation = 0;
@@ -110,6 +111,20 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         *cache.max_private_continuations >
             std::numeric_limits<std::size_t>::max() / *cache.max_long_anchors_per_continuation) {
         throw std::overflow_error("context cache long-anchor capacity exceeds size_t");
+    }
+    if (cache.host_tier_device) {
+        if (*cache.host_tier_device < 0) {
+            throw std::invalid_argument("context cache host tier device must be a CUDA ordinal");
+        }
+        // The tier device must be idle: PP2/TP2 ranks would compete with it for VRAM.
+        if (options.placement.mode != ParallelMode::Single) {
+            throw std::invalid_argument(
+                "context cache host tier device requires Single placement");
+        }
+        if (*cache.host_tier_device == options.device) {
+            throw std::invalid_argument(
+                "context cache host tier device must differ from the compute device");
+        }
     }
     return options;
 }

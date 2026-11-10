@@ -462,10 +462,12 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
 
     if (cache.enabled) {
         logger_->info(
-            "context cache | {} active + {} cached device states | host {} states, {} KV | "
+            "context cache | {} active + {} cached device states | host {} states, {} KV in {} | "
             "private {} | shared {} | anchors {}",
             engine.max_concurrency, *cache.device_state_slots, cache.host_state_slots,
             product::format_pretty_bytes(cache.host_kv_capacity_bytes),
+            cache.host_tier_device ? "GPU" + std::to_string(*cache.host_tier_device)
+                                   : std::string("pinned RAM"),
             *cache.max_private_continuations, *cache.max_shared_prefixes,
             *cache.max_long_anchors_per_continuation);
     } else {
