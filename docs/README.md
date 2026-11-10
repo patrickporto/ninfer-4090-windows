@@ -12,6 +12,8 @@ run the CLI or HTTP server.
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
 | [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
+| [Multi-GPU](multi-gpu.md) | PP2/TP2 across two GPUs and the second-GPU context-cache tier |
+| [RTX 4090 tuning study](rtx4090-tuning.md) | measured KV formats, MTP3 vs DFlash2, concurrency, and cache tier behind the recommended configuration |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 
 The executable `--help` output is the exact source for command-line option spelling and defaults.

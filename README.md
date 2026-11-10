@@ -1,17 +1,80 @@
 # NInfer-4090
 
-NInfer-4090 runs **Qwen3.8-27B** on one 24 GB NVIDIA GeForce RTX 4090. It is an `sm_89` port of
-[NInfer-3090](https://github.com/Don-Chad/ninfer-3090), which derives from
-[Neroued/ninfer](https://github.com/Neroued/ninfer), a specialized C++20/CUDA inference engine.
-The engine loads the official groupwise `.ninfer` artifact, serves OpenAI- and
-Anthropic-compatible APIs, and supports paged KV, compatible-prefix reuse, CUDA Graphs, MTP
-speculative decoding, reasoning-effort control, and ReplaySSM state transactions.
+NInfer-4090 runs **Qwen3.8-27B** on one 24 GB NVIDIA GeForce RTX 4090, optionally helped by a
+second GPU. It is an `sm_89` port of [NInfer-3090](https://github.com/Don-Chad/ninfer-3090),
+which derives from [Neroued/ninfer](https://github.com/Neroued/ninfer), a specialized
+C++20/CUDA inference engine. The engine loads the official groupwise `.ninfer` artifact, serves
+OpenAI- and Anthropic-compatible APIs, and supports paged KV, compatible-prefix reuse, CUDA
+Graphs, MTP and DFlash2 speculative decoding, reasoning-effort control, and ReplaySSM state
+transactions.
 
-This fork targets `sm_89` and Linux. Blackwell-only NVFP4/W4A4 execution is unavailable; the
-engine uses the same groupwise-int path as the 3090 base. The Windows path and the
-Qwen3.6-35B-A3B target are inherited but untested on the RTX 4090.
+This repository adds, on top of the 4090 port:
 
-## Measured results on the RTX 4090
+- **Two-GPU execution:** pipeline (PP2) and tensor (TP2) parallelism across mixed
+  sm_89/sm_120 pairs without P2P ([docs/multi-gpu.md](docs/multi-gpu.md)).
+- **Second GPU as context-cache tier:** `--host-tier-device N` keeps demoted KV and state in an
+  idle GPU's VRAM instead of pinned RAM.
+- **Four concurrent lanes** at the full 262K context, with fair access for API calls that
+  wait on the engine.
+- **PDF input** (Linux builds) and **Windows + Linux release builds** published by CI on every
+  push to `main` (see [Releases](#releases)).
+- A measured **KV-format and speculative-decoding study** that changed the recommended KV mode
+  to `rk4v4` ([docs/rtx4090-tuning.md](docs/rtx4090-tuning.md)).
+
+Blackwell-only NVFP4/W4A4 execution is unavailable on the 4090; the engine uses the same
+groupwise-int path as the 3090 base. The Qwen3.6-35B-A3B target is inherited but untested here.
+
+## Recommended configuration
+
+Measured on an RTX 4090 with an RTX 5070 Ti as the idle second GPU (2026-11). This is the
+configuration running in production:
+
+```bash
+CUDA_VISIBLE_DEVICES=<rtx4090>,<second-gpu> ninfer-serve models/qwen3_8_27b.ninfer \
+  --host 127.0.0.1 --port 11434 \
+  --max-context 262144 --kv-capacity 262144 \
+  --max-concurrency 4 --device-state-slots 2 \
+  --host-state-slots 8 --host-kv-mib 8192 --host-tier-device 1 \
+  --max-pending-requests 16 --pending-timeout-ms 600000 --prefill-chunk 1024 \
+  --kv-dtype rk4v4 --spec mtp --draft-tokens 3 --lm-head-draft \
+  --preserve-thinking --vision --vision-max-tokens 4096
+```
+
+Without a second GPU, drop `--host-tier-device 1` (the cache tier then lives in pinned RAM;
+`--host-kv-mib 2048 --host-state-slots 4` keeps it at about 2.8 GiB).
+
+Why each choice (details and raw numbers in [docs/rtx4090-tuning.md](docs/rtx4090-tuning.md)):
+
+| Choice | Measured reason |
+|---|---|
+| `--kv-dtype rk4v4` | Same 266K ceiling as `rk4v4-e8`, about half its loss on code (dNLL vs bf16 +0.0018 against +0.0033), same speed. 8-bit formats cost 30-50% of the context for no measurable gain. |
+| MTP3 over DFlash2 | DFlash2 K=5 is 12-22% faster on code but leaves only 74K of KV with four lanes and vision (168K with two lanes). |
+| 4 lanes | 210 tok/s aggregate on the code benchmark against 144 tok/s for one lane; the KV pool is shared, so one session still reaches 256K. |
+| `--device-state-slots 2` | The default (4) leaves the four-lane 256K profile about 100 MB short. |
+| `--host-tier-device 1` | Restores from the 5070 Ti tier run at 12.3 GB/s (pinned RAM: 13.4) and frees about 9 GiB of pinned RAM. |
+
+| Workload (this configuration) | Result |
+|---|---|
+| Code generation, 1 request | 144 tok/s, 11/12 tasks pass |
+| Code generation, 4 concurrent | 210 tok/s aggregate |
+| Resume a 7.3K-token conversation from the cache tier | 0.5 s (re-prefill: 2.5 s) |
+| KV quality, `rk4v4` vs `bf16`, 1M-token corpus at 64K windows | PPL 4.414 vs 4.419 |
+
+## Releases
+
+Every push to `main` builds and publishes a prerelease on GitHub Releases:
+
+- **Windows x64** (MSVC): Single and Pipeline placement; no Tensor placement (NCCL is
+  Linux-only) and no PDF input.
+- **Linux x64** (Ubuntu 24.04, NCCL 2.29.7 bundled): Single, Pipeline and Tensor placement,
+  PDF input. It links the distribution's FFmpeg 6 and poppler-glib; other distributions
+  should build from source.
+
+Both target `sm_89` and `sm_120`. Each release has a runtime archive (`ninfer`, `ninfer-serve`,
+topology probe) and a `-tools` archive (`ninfer-perplexity`, `ninfer_bench`) that extracts into
+the same folder.
+
+## Earlier measurements on the RTX 4090
 
 Conditions: single request, greedy decoding, CUDA Graphs on, INT8 KV, `--prefill-chunk 1024`,
 official 16.96 GiB Qwen3.8-27B artifact. The code-generation decode row and the prefill rows
@@ -32,8 +95,9 @@ decode rows use the `ninfer` CLI.
 MTP acceptance, and with it the decoded rate, tracks how predictable the output is: structured
 code accepts about 81% of draft tokens, the mixed bench corpus about 49%.
 
-The shipping default has since moved from INT8 KV to the E8 4-bit KV mode, which serves the
-model's full native 262,144-token context on this card. Retrieval stays exact through 260K
+The default later moved from INT8 KV to the E8 4-bit KV mode, and in 2026-11 to `rk4v4`
+(same capacity, lower loss; see [Recommended configuration](#recommended-configuration)). Both
+4-bit modes serve the model's full native 262,144-token context on this card. Retrieval stays exact through 260K
 (single-needle, 5-needle, and exact-code-detail probes), MTP acceptance at depth is unchanged,
 and the costs against the INT8 numbers above are a 5.7% decode tax and 1-2% of prefill; see
 [Quick start](#text-only-full-262k-native-context-e8-4-bit-kv-default) for the measured deltas.
@@ -113,13 +177,12 @@ NINFER_MODEL_DIR="$PWD/models" bash scripts/download-qwen38.sh
 
 Then start one of the three profiles. The API is available at `http://127.0.0.1:8080/v1`.
 
-The profiles as written run one generation slot. `--max-concurrency 2` is measured
-and worthwhile on the 4090: the second lane costs about 390 MiB (state pools plus a
-doubled CUDA-graph allowance) while the KV page pool stays shared, so a lone session
-still uses the full context; single-stream decode is unregressed and two sessions
-decode batched at roughly 1.5x aggregate throughput, each lane keeping its own
-resident prefix. Prefill still serializes across lanes, so a deep cold prefill
-delays the other lane's first token.
+The profiles as written run one generation slot. More lanes are measured and worthwhile:
+each lane costs a few hundred MiB (state pools plus CUDA-graph allowance) while the KV page
+pool stays shared, so a lone session still uses the full context. Two lanes decode at roughly
+1.5x aggregate throughput; four lanes (with `--device-state-slots 2` to fit 256K and vision)
+reach 210 tok/s aggregate on code against 144 tok/s for one. Prefill still serializes across
+lanes, so a deep cold prefill delays the other lanes' first token.
 
 When clients edit recent conversation history (a re-serialized reply, tool results
 folded into the previous turn, an updated agent memory block), the server proposes a
@@ -143,12 +206,14 @@ a client that does not parse error events sees a stream that ends without a
 `finish_reason`. See [docs/serving.md](docs/serving.md) for the full queue
 contract.
 
-### Text-only, full 262K native context (E8 4-bit KV, default)
+### Text-only, full 262K native context (4-bit KV, default)
 
-The E8 Conway-Sloane lattice KV mode (`rk4v4-e8`, ported from
+The rotated 4-bit KV modes (`rk4v4`, and the E8 lattice variant `rk4v4-e8`, ported from
 [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090); see
-[the fork comparison](docs/udp-fork-comparison.md)) fits the model's entire native
-262,144-token context on 24 GB with 1.4 GiB to spare:
+[the fork comparison](docs/udp-fork-comparison.md)) fit the model's entire native
+262,144-token context on 24 GB with about 1.4 GiB to spare. `rk4v4` is the default since
+2026-11: same capacity and speed as `rk4v4-e8`, lower loss
+([measurements](docs/rtx4090-tuning.md#kv-cache-format)):
 
 ```bash
 docker run --rm --gpus all --publish 8080:8080 \
@@ -159,12 +224,12 @@ docker run --rm --gpus all --publish 8080:8080 \
   --max-context 262144 --kv-capacity 262144 \
   --max-concurrency 1 --max-pending-requests 16 \
   --pending-timeout-ms 600000 \
-  --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
+  --prefill-chunk 1024 --kv-dtype rk4v4 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --preserve-thinking
 ```
 
-Measured against INT8 KV on this build: identical MTP acceptance at 111K depth
+Measured for `rk4v4-e8` against INT8 KV on an earlier build: identical MTP acceptance at 111K depth
 (78.8% vs 78.4%), a 5.7% decode tax (126.6 vs 134.2 tok/s on a shallow greedy code
 probe), prefill within 1-2% at matched depth, and exact single-needle, 5-needle, and
 code-detail retrieval through 260K tokens.
@@ -185,7 +250,7 @@ docker run --rm --gpus all --publish 8080:8080 \
   --preserve-thinking
 ```
 
-### With vision, full 262K context (E8 4-bit KV)
+### With vision, full 262K context (4-bit KV)
 
 The vision scratchpad defaults to 8192 tokens (`--vision-max-tokens`, ported from
 the same fork as the E8 KV modes) instead of the former hardcoded 32768. The
@@ -201,7 +266,7 @@ docker run --rm --gpus all --publish 8080:8080 \
   --max-context 262144 --kv-capacity 262144 \
   --max-concurrency 1 --max-pending-requests 16 \
   --pending-timeout-ms 600000 \
-  --prefill-chunk 1024 --kv-dtype rk4v4-e8 \
+  --prefill-chunk 1024 --kv-dtype rk4v4 \
   --spec mtp --draft-tokens 3 --lm-head-draft \
   --vision --preserve-thinking
 ```
@@ -220,7 +285,9 @@ scratchpad costs about 62 MiB of VRAM.
 
 ### The tradeoff
 
-KV precision, vision, and maximum context trade against each other on a 24 GB card:
+KV precision, vision, and maximum context trade against each other on a 24 GB card
+(earlier single-lane measurements; `rk4v4` sizes exactly like `rk4v4-e8`; the four-lane
+capacity of every format is in [docs/rtx4090-tuning.md](docs/rtx4090-tuning.md#capacity)):
 
 | Profile | KV mode | Context | KV runtime | Startup slack |
 |---|---|---:|---:|---:|
@@ -367,9 +434,16 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
 
 - **Two-GPU pipeline and tensor parallelism.** `--parallel pipeline|tensor --devices A,B` runs
   Qwen3.8-27B across two GPUs, including mixed sm_89/sm_120 pairs without P2P. TP2 decodes
-  ~30% faster than one RTX 4090 without MTP; details and limits in
-  [docs/multi-gpu.md](docs/multi-gpu.md).
+  ~30% faster than one RTX 4090 without MTP (66 against 50.5 tok/s); MTP3 on one 4090 remains
+  faster. Details and limits in [docs/multi-gpu.md](docs/multi-gpu.md).
+- **Second GPU as context-cache tier.** `--host-tier-device N` backs the Host StateImage and
+  Host KV tiers with an idle GPU's VRAM instead of pinned RAM. Tier copies use
+  `cudaMemcpyDefault`, so they need no P2P; greedy output and cache hits match the pinned tier.
+- **Fair engine access.** API calls that need the engine lock (memory summary, cancellation)
+  yield-wait at most 50 ms instead of starving behind back-to-back decode rounds.
 - **PDF input.** Chat requests may attach PDFs; text is extracted locally (poppler, Linux builds).
+- **Windows and Linux release CI.** `.github/workflows/release.yml` builds both platforms for
+  `sm_89` + `sm_120` and publishes a prerelease on every push to `main`.
 
 ## Known limits on the RTX 4090
 
@@ -382,15 +456,17 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
   residency tables (the former hard abort above chunk 1024 is fixed), and chunks through 2688
   stay on split-K. Larger chunks route to the unsplit schedule, which is marginally less
   accurate at its onset (about 1e-5 relative).
-- `--max-concurrency 2` is measured on the 4090 (see Quick start); higher lane counts are
-  untested here, and the published cohort results in the
-  [3090 base](https://github.com/Don-Chad/ninfer-3090) do not transfer directly.
+- Up to four lanes are measured on the 4090 (see [Recommended configuration](#recommended-configuration));
+  more are untested here.
 - Prefill is strictly serialized across lanes with no chunk-level interleaving, and decode
   starves while any prefill runs: a short request submitted behind a 31k-token cold prefill
   measured a 13.5 s first token. Concurrency pays off for decode and for per-lane resident
   prefixes, not for prefill fairness.
-- The limits of the base engine apply: one process, one GPU, one model, bounded FIFO admission,
-  no multi-GPU execution, no weight offload.
+- DFlash2 fits only 74K of KV with four lanes and vision (168K with two lanes); see
+  [the tuning study](docs/rtx4090-tuning.md#speculative-decoding-mtp3-vs-dflash2).
+- The limits of the base engine apply: one process, one model, bounded FIFO admission, no
+  weight offload. Two-GPU placement is limited to the PP2/TP2 modes in
+  [docs/multi-gpu.md](docs/multi-gpu.md), and `--host-tier-device` requires Single placement.
 
 ## Artifact
 
@@ -402,7 +478,8 @@ GCC 13, and CMake 3.28 or newer; the Docker image builds with CUDA 13.1.
 The download scripts fetch the pinned `3526913004b1` revision, which is the artifact this fork is
 validated with. The artifact is architecture-independent; the model card's RTX 5090 requirement
 describes the upstream engine, not the file. The `dc370fb6295a` revision adds the DFlash2 draft
-weights and loads on the same engine (`--spec dflash2 --draft-tokens 3` to use them).
+weights and loads on the same engine (`--spec dflash2 --draft-tokens 5` to use them; K=5 is the
+fastest measured on code that still serves four lanes, at reduced context).
 
 **Do not download the `main` revision.** Since 2026-09-15 it is a container-v3 artifact with a
 maintained jinja chat template. This fork reads container v2 only and rejects v3 with

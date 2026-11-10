@@ -18,6 +18,8 @@ for the selected tool.
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
+| Code-generation speed and pass rate of a server | [`tuning/codebench.py`](tuning/codebench.py) |
+| Qualify a context-cache tier (forced demotion and resume) | [`tuning/host_tier_qualify.py`](tuning/host_tier_qualify.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 
 ## Artifact workflow
