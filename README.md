@@ -37,7 +37,7 @@ CUDA_VISIBLE_DEVICES=<rtx4090>,<second-gpu> ninfer-serve models/qwen3_8_27b.ninf
   --host-state-slots 16 --host-kv-mib 10240 --host-tier-device 1 \
   --max-pending-requests 16 --pending-timeout-ms 600000 --prefill-chunk 1024 \
   --kv-dtype rk4v4 --spec mtp --draft-tokens 3 --lm-head-draft \
-  --preserve-thinking --vision --vision-max-tokens 4096
+  --preserve-thinking --default-reasoning-effort medium --vision --vision-max-tokens 4096
 ```
 
 Without a second GPU, drop `--host-tier-device 1` (the cache tier then lives in pinned RAM;
@@ -52,6 +52,7 @@ Why each choice (details and raw numbers in [docs/rtx4090-tuning.md](docs/rtx409
 | 4 lanes | 210 tok/s aggregate on the code benchmark against 144 tok/s for one lane; the KV pool is shared, so one session still reaches 256K. |
 | `--device-state-slots 2` | The default (4) leaves the four-lane 256K profile about 100 MB short. |
 | `--host-tier-device 1` | Restores from the 5070 Ti tier run at 12.3 GB/s (pinned RAM: 13.4) and frees about 9 GiB of pinned RAM. |
+| `--default-reasoning-effort medium` | Agents that enable thinking without naming an effort got `xhigh`, the template default (1,584 of the day's 1,599 thinking requests); clients that pick an effort explicitly are unaffected. |
 | `--host-state-slots 16 --host-kv-mib 10240` | With five concurrent agent sessions the 8 state slots filled while the KV tier stayed under 6 GiB; 16 slots and 10 GiB fit the 5070 Ti at 13.9 of 16.3 GB. |
 
 | Workload (this configuration) | Result |
@@ -489,18 +490,24 @@ maintained jinja chat template. This fork reads container v2 only and rejects v3
 
 ## Reasoning effort
 
-Qwen3.8-27B has three trained reasoning depths plus an off switch. OpenAI Chat Completions
-accepts a top-level `reasoning_effort` field (`low`, `medium`, `xhigh`) and a top-level
-`enable_thinking` boolean; hidden reasoning returns separately as `message.reasoning_content`.
-Only those three levels are accepted, plus `none` to turn thinking off. `high`, `minimal`, and
-`max` are rejected as `reasoning_effort_not_supported`, so a client that offers a `high` setting
-must map it to `xhigh`. A token budget for reasoning is separate from the effort level. It is
-set only through the Anthropic Messages path (`thinking.budget_tokens`) or server-wide with
-`--default-thinking-budget N`; the OpenAI paths have no field for it. Without a budget,
-reasoning is bounded only by the request's `max_tokens`, which is what the model card
-recommends, and the `model_thinking_tokens` field of the request JSONL reads zero, because that
-counter runs only under a budget. The `chat_template_kwargs` request field of llama.cpp is not
-supported and is rejected. For the CLI, pass `--reasoning-effort` or `--no-thinking`. Sampling
+Qwen3.8-27B has three trained reasoning depths (`low`, `medium`, `xhigh`) plus an off switch.
+Every API takes the OpenAI vocabulary: Chat Completions `reasoning_effort` (or
+`chat_template_kwargs.reasoning_effort` / `enable_thinking`), Responses `reasoning.effort`, and
+Anthropic Messages `output_config.effort`. `none` turns thinking off; `minimal` rounds to `low`
+and `high`/`max` to `xhigh`; anything else is a 400 listing the accepted values. Hidden reasoning
+returns as `message.reasoning_content` (Chat), a `reasoning` item with `reasoning_text`
+(Responses; `reasoning.summary` is accepted and ignored, as on open-weight servers) or `thinking`
+blocks (Messages), and every usage block counts reasoning tokens. `GET /v1/models` advertises
+the controls (`supported_parameters`, and `reasoning` with `supported_efforts`,
+`native_efforts`, `default_effort`, `can_disable`). A thinking request that names no effort
+uses the template default, `xhigh`; `--default-reasoning-effort low|medium|high|xhigh` changes
+that server-wide while an explicit request effort still wins. A token budget for reasoning is
+separate from the effort level. It is set only through the Anthropic Messages path
+(`thinking.budget_tokens`) or server-wide with `--default-thinking-budget N`; the OpenAI paths
+have no field for it. Without a budget, reasoning is bounded only by the request's
+`max_tokens`, which is what the model card recommends, and the `model_thinking_tokens` field of
+the request JSONL reads zero, because that counter runs only under a budget. For the CLI, pass
+`--reasoning-effort` or `--no-thinking`. Sampling
 defaults come from the model card and switch with the thinking mode: `temperature=1.0`,
 `top_p=0.95`, `top_k=20` in thinking mode; `temperature=0.7`, `top_p=0.80`, `top_k=20`,
 `presence_penalty=1.5` in non-thinking mode.
