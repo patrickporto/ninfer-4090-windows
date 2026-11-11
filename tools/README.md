@@ -20,6 +20,7 @@ for the selected tool.
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Code-generation speed and pass rate of a server | [`tuning/codebench.py`](tuning/codebench.py) |
 | Qualify a context-cache tier (forced demotion and resume) | [`tuning/host_tier_qualify.py`](tuning/host_tier_qualify.py) |
+| Reproduce cache loss under concurrent long agent sessions | [`tuning/cache_pressure_repro.py`](tuning/cache_pressure_repro.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 
 ## Artifact workflow

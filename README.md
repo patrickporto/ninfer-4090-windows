@@ -34,7 +34,7 @@ CUDA_VISIBLE_DEVICES=<rtx4090>,<second-gpu> ninfer-serve models/qwen3_8_27b.ninf
   --host 127.0.0.1 --port 11434 \
   --max-context 262144 --kv-capacity 262144 \
   --max-concurrency 4 --device-state-slots 2 \
-  --host-state-slots 8 --host-kv-mib 8192 --host-tier-device 1 \
+  --host-state-slots 16 --host-kv-mib 10240 --host-tier-device 1 \
   --max-pending-requests 16 --pending-timeout-ms 600000 --prefill-chunk 1024 \
   --kv-dtype rk4v4 --spec mtp --draft-tokens 3 --lm-head-draft \
   --preserve-thinking --vision --vision-max-tokens 4096
@@ -52,12 +52,14 @@ Why each choice (details and raw numbers in [docs/rtx4090-tuning.md](docs/rtx409
 | 4 lanes | 210 tok/s aggregate on the code benchmark against 144 tok/s for one lane; the KV pool is shared, so one session still reaches 256K. |
 | `--device-state-slots 2` | The default (4) leaves the four-lane 256K profile about 100 MB short. |
 | `--host-tier-device 1` | Restores from the 5070 Ti tier run at 12.3 GB/s (pinned RAM: 13.4) and frees about 9 GiB of pinned RAM. |
+| `--host-state-slots 16 --host-kv-mib 10240` | With five concurrent agent sessions the 8 state slots filled while the KV tier stayed under 6 GiB; 16 slots and 10 GiB fit the 5070 Ti at 13.9 of 16.3 GB. |
 
 | Workload (this configuration) | Result |
 |---|---|
 | Code generation, 1 request | 144 tok/s, 11/12 tasks pass |
 | Code generation, 4 concurrent | 210 tok/s aggregate |
 | Resume a 7.3K-token conversation from the cache tier | 0.5 s (re-prefill: 2.5 s) |
+| Five agent sessions of 30-127K tokens, 15 resumes | 0 lost the cache (15 at 95-99% hits), about 1 s of work per turn |
 | KV quality, `rk4v4` vs `bf16`, 1M-token corpus at 64K windows | PPL 4.414 vs 4.419 |
 
 ## Releases

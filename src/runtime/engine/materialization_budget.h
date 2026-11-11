@@ -21,7 +21,7 @@ template <class Clock = std::chrono::steady_clock>
 // sealing cannot be cancelled by this allowance, but their elapsed time reduces optional headroom.
 struct PlanningAllowance {
     std::uint64_t started_ns              = planning_now_ns();
-    std::uint64_t limit_ns                = 50'000'000;
+    std::uint64_t limit_ns                = 400'000'000;
     std::uint32_t affected_requests       = 1;
     const std::atomic<bool>* cancellation = nullptr;
     std::uint64_t control_deadline_ns     = std::numeric_limits<std::uint64_t>::max();
@@ -29,7 +29,9 @@ struct PlanningAllowance {
     [[nodiscard]] static PlanningAllowance
     boundary(std::uint32_t other_runnable, std::uint64_t now = planning_now_ns()) noexcept {
         return {.started_ns        = now,
-                .limit_ns          = other_runnable == 0 ? 50'000'000ULL : 10'000'000ULL,
+                // A failed search falls back to evicting every cache victim, which can cost
+                // minutes of re-prefill; a few hundred ms of planning is cheap in comparison.
+                .limit_ns          = other_runnable == 0 ? 400'000'000ULL : 150'000'000ULL,
                 .affected_requests = 1U + other_runnable};
     }
 
@@ -51,7 +53,7 @@ public:
                                 std::uint64_t initial_cost) noexcept
         : allowance_(allowance), started_(started),
           granted_(std::min(
-              {std::uint64_t{5'000'000}, economic(initial_cost), allowance.remaining(started)})) {}
+              {std::uint64_t{50'000'000}, economic(initial_cost), allowance.remaining(started)})) {}
 
     [[nodiscard]] bool allow(std::uint64_t now, std::uint64_t next_operation_ns,
                              std::uint64_t completion_ns, std::uint64_t gain_ns,

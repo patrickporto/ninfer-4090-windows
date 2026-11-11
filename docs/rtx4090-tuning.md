@@ -111,6 +111,37 @@ about 2.5 s of re-prefill, with identical greedy text and cache hits for the pin
 tiers. With `--host-kv-mib 8192 --host-state-slots 8` on the 5070 Ti, pinned host memory
 drops from 9.2 GiB to near zero.
 
+## Concurrent long agent sessions
+
+Production showed agents of 150-230K tokens re-prefilling from 0% cache every turn (2-5 minutes
+each) while other agents queued. `tools/tuning/cache_pressure_repro.py` reproduces it: several
+long conversations run concurrently, each appending about 1.5K tokens per turn, with the
+agents' `max_tokens` of 32,768. Two mechanisms were found:
+
+- **Planner time budget.** Fitting a large continuation searches for which cached conversations
+  to demote to the Host tier. The search had 10 ms when other requests were runnable (50 ms
+  otherwise, first grant 5 ms); when it ran out it fell back to evicting every cached
+  conversation (request log: `search_budget_exhaustions`, `maximal_fallback_selections`,
+  `private_owners_evicted`). A lost cache costs 30-280 s of re-prefill, so the limits are now
+  150 ms / 400 ms with a 50 ms first grant.
+- **Whole-pool requests.** A request reserves prompt + `max_tokens` (capped at the pool), so a
+  230K prompt with `max_tokens` 32,768 needs the entire 262K device pool and every other
+  conversation must leave the device at once. No tier size or budget kept the cache in that
+  case; capping the client context (128K in opencode) avoids it.
+
+Five sessions of 120/110/90/60/30K tokens, four turns each, production flags with
+`--host-kv-mib 8192 --host-state-slots 8`:
+
+| Build | Resumes at 0% cache | Median hit | Wall time |
+|---|---:|---:|---:|
+| 10 ms / 50 ms budget | 4 of 15 | 97.6% | 287 s |
+| 150 ms / 400 ms budget | 0 of 15 | 98.5% | 190 s |
+
+Greedy outputs and cache hits on the Host tier qualification are identical to the previous
+build. Splitting demotions into 16K-token extents (against Host arena fragmentation) did not
+help and was not kept. The run filled all 8 Host state slots while the Host KV stayed under
+6 GiB, so production uses `--host-state-slots 16 --host-kv-mib 10240`.
+
 ## Multi-GPU compute
 
 Pipeline (PP2) and tensor (TP2) parallelism across the 4090 and 5070 Ti are covered in
