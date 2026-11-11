@@ -932,11 +932,22 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
     static const std::unordered_set<std::string> allowed = {"effort", "context", "summary",
                                                             "generate_summary", "mode"};
     reject_nonnull_unknown_members(reasoning, allowed, "reasoning");
-    for (const char* key : {"context", "summary", "generate_summary", "mode"}) {
+    for (const char* key : {"context", "mode"}) {
         if (reasoning.contains(key) && !reasoning.at(key).is_null()) {
             bad_request("reasoning." + std::string(key) +
                             " changes reasoning input or output and is not supported",
                         "reasoning", "reasoning_option_not_supported");
+        }
+    }
+    // Codex CLI and the OpenAI SDKs send summary "auto" by default. Open-weight servers (vLLM
+    // with gpt-oss, for example) accept it and return the full reasoning_text with an empty
+    // summary, which is what NInfer already emits; rejecting it broke those clients.
+    for (const char* key : {"summary", "generate_summary"}) {
+        if (!reasoning.contains(key) || reasoning.at(key).is_null()) { continue; }
+        const Json& value = reasoning.at(key);
+        if (!value.is_string() || (value != "auto" && value != "concise" && value != "detailed")) {
+            bad_request("reasoning." + std::string(key) + " must be auto, concise, or detailed",
+                        "reasoning");
         }
     }
     if (!reasoning.contains("effort") || reasoning.at("effort").is_null()) { return; }
