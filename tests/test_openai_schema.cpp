@@ -876,6 +876,24 @@ int test_common_objects() {
     failures += check(vision_models["data"][0]["modalities"]["vision"] == true &&
                           vision_model["modalities"]["vision"] == true,
                       "a vision deployment advertises the vision modality");
+    failures += check(!models["data"][0].contains("reasoning") &&
+                          !models["data"][0].contains("supported_parameters"),
+                      "a deployment without reasoning metadata advertises no reasoning controls");
+    const ModelReasoningInfo reasoning{.can_disable    = true,
+                                       .native_efforts = {"low", "medium", "xhigh"},
+                                       .default_effort = "medium"};
+    const Json reasoning_models = Json::parse(make_models_list("qwen", 7, 240000, true, reasoning));
+    const Json& advertised      = reasoning_models["data"][0];
+    failures += check(advertised["reasoning"]["default_effort"] == "medium" &&
+                          advertised["reasoning"]["can_disable"] == true &&
+                          advertised["reasoning"]["native_efforts"].size() == 3 &&
+                          advertised["reasoning"]["supported_efforts"][0] == "none",
+                      "models list advertises reasoning efforts and the default");
+    bool lists_effort = false;
+    for (const Json& parameter : advertised["supported_parameters"]) {
+        lists_effort = lists_effort || parameter == "reasoning_effort";
+    }
+    failures += check(lists_effort, "supported_parameters lists reasoning_effort");
     const Json error = Json::parse(make_error_body(
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",

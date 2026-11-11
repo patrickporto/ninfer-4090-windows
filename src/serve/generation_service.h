@@ -108,6 +108,9 @@ public:
                                std::shared_ptr<spdlog::logger> logger = {});
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
+    [[nodiscard]] const ninfer::PromptCapabilities& prompt_capabilities() const noexcept {
+        return prompt_capabilities_;
+    }
 
     // Engine owns the once-normalized startup configuration. Serving diagnostics must use this
     // value instead of reinterpreting optional defaults from ServeOptions.

@@ -542,9 +542,40 @@ void HttpServer::register_routes() {
     });
 }
 
+ModelReasoningInfo HttpServer::reasoning_info() const {
+    ModelReasoningInfo info;
+    if (service_ == nullptr) { return info; }
+    const ninfer::PromptCapabilities& caps = service_->prompt_capabilities();
+    const auto name                        = [](ninfer::ReasoningEffort effort) -> std::string {
+        switch (effort) {
+        case ninfer::ReasoningEffort::Low:
+            return "low";
+        case ninfer::ReasoningEffort::Medium:
+            return "medium";
+        case ninfer::ReasoningEffort::XHigh:
+            return "xhigh";
+        }
+        return "xhigh";
+    };
+    for (const auto effort : {ninfer::ReasoningEffort::Low, ninfer::ReasoningEffort::Medium,
+                              ninfer::ReasoningEffort::XHigh}) {
+        if (caps.reasoning_effort.supports(effort)) { info.native_efforts.push_back(name(effort)); }
+    }
+    info.can_disable = caps.enable_thinking;
+    if (!options_.enable_thinking) {
+        info.default_effort = "none";
+    } else if (options_.default_reasoning_effort &&
+               caps.reasoning_effort.supports(*options_.default_reasoning_effort)) {
+        info.default_effort = name(*options_.default_reasoning_effort);
+    } else if (caps.reasoning_effort.default_effort) {
+        info.default_effort = name(*caps.reasoning_effort.default_effort);
+    }
+    return info;
+}
+
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
     res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context,
-                                     options_.enable_vision),
+                                     options_.enable_vision, reasoning_info()),
                     "application/json");
 }
 
@@ -560,7 +591,7 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         return;
     }
     res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context,
-                                      options_.enable_vision),
+                                      options_.enable_vision, reasoning_info()),
                     "application/json");
 }
 

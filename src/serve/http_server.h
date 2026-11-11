@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/generation_service.h"
+#include "serve/openai_common.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
@@ -86,6 +87,7 @@ private:
     void handle_response_input_items(const httplib::Request& req, httplib::Response& res);
     void handle_response_cancel(const httplib::Request& req, httplib::Response& res);
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
+    [[nodiscard]] ModelReasoningInfo reasoning_info() const;
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
     void handle_slot_action(const httplib::Request& req, httplib::Response& res);

@@ -1,4 +1,6 @@
 #pragma once
+#include <vector>
+#include <optional>
 
 // OpenAI wire objects shared by Chat Completions and Responses HTTP handlers.
 
@@ -28,10 +30,19 @@ struct OpenAIPromptCachePolicy {
 [[nodiscard]] OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body);
 void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCachePolicy policy);
 
+// Reasoning controls advertised by /v1/models so clients can discover them.
+struct ModelReasoningInfo {
+    bool can_disable = false;               // reasoning_effort "none" turns thinking off
+    std::vector<std::string> native_efforts; // levels the chat template implements
+    std::optional<std::string> default_effort;
+};
+
 std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             std::uint32_t max_model_len, bool vision = false);
+                             std::uint32_t max_model_len, bool vision = false,
+                             const ModelReasoningInfo& reasoning = {});
 std::string make_model_object(const std::string& model_id, std::int64_t created,
-                              std::uint32_t max_model_len, bool vision = false);
+                              std::uint32_t max_model_len, bool vision = false,
+                              const ModelReasoningInfo& reasoning = {});
 std::string make_error_body(const ApiError& error);
 std::int64_t unix_time_now();
 
