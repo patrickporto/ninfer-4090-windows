@@ -70,6 +70,8 @@ struct ServeOptions {
     // Recover complete Qwen tool calls from output the strict parser returns as text.
     bool tolerant_tool_calls = false;
     std::optional<std::uint32_t> default_thinking_budget;
+    // Effort for thinking-enabled requests that name none (the template default is xhigh).
+    std::optional<ReasoningEffort> default_reasoning_effort;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     // Process-level explicit overrides layered between registered model/mode defaults and request

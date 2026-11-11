@@ -455,6 +455,21 @@ std::string format_server_start_json(
         default_thinking_budget = *options.default_thinking_budget;
     }
 
+    Json default_reasoning_effort = nullptr;
+    if (options.default_reasoning_effort) {
+        switch (*options.default_reasoning_effort) {
+        case ReasoningEffort::Low:
+            default_reasoning_effort = "low";
+            break;
+        case ReasoningEffort::Medium:
+            default_reasoning_effort = "medium";
+            break;
+        case ReasoningEffort::XHigh:
+            default_reasoning_effort = "xhigh";
+            break;
+        }
+    }
+
     record["server"]                               = Json{{"host", options.host},
                                                           {"port", options.port},
                                                           {"public_model_id", public_model_id},
@@ -469,6 +484,7 @@ std::string format_server_start_json(
                                                           {"default_output_tokens", options.default_max_tokens},
                                                           {"default_thinking", options.enable_thinking},
                                                           {"default_thinking_budget", std::move(default_thinking_budget)},
+                                                          {"default_reasoning_effort", std::move(default_reasoning_effort)},
                                                           {"default_preserve_thinking", options.preserve_thinking}};
     record["artifact"]                             = Json{{"path", options.artifact_path},
                                                           {"size_bytes", std::move(artifact_size)},

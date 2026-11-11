@@ -123,6 +123,10 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
             invalid_prompt_option("assistant prefill cannot be combined with enabled thinking",
                                   "messages", "assistant_prefill_not_supported");
         }
+        if (result.enable_thinking && !result.reasoning_effort && server.default_reasoning_effort &&
+            capabilities.reasoning_effort.supports(*server.default_reasoning_effort)) {
+            result.reasoning_effort = server.default_reasoning_effort;
+        }
         if (result.enable_thinking) {
             result.effective_reasoning_effort = result.reasoning_effort
                                                     ? result.reasoning_effort

@@ -193,6 +193,22 @@ int main() {
     } catch (const std::invalid_argument&) { zero_thinking_budget_rejected = true; }
     failures += check(zero_thinking_budget_rejected, "zero --default-thinking-budget was accepted");
 
+    failures += check(!defaults.default_reasoning_effort,
+                      "default reasoning effort was set without --default-reasoning-effort");
+    const ServeOptions medium_effort =
+        parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort", "medium"});
+    failures += check(medium_effort.default_reasoning_effort == ninfer::ReasoningEffort::Medium,
+                      "--default-reasoning-effort medium was not preserved");
+    const ServeOptions high_effort =
+        parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort", "high"});
+    failures += check(high_effort.default_reasoning_effort == ninfer::ReasoningEffort::XHigh,
+                      "--default-reasoning-effort high did not round to xhigh");
+    bool unknown_effort_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort", "none"});
+    } catch (const std::invalid_argument&) { unknown_effort_rejected = true; }
+    failures += check(unknown_effort_rejected, "--default-reasoning-effort none was accepted");
+
     bool empty_model_id_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--model-id", ""});

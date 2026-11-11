@@ -88,7 +88,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] "
            "[--parallel single|pipeline|tensor --devices A,B [--pipeline-split N]] "
            "[--spec mtp|dflash|dflash2 --draft-tokens N] "
-           "[--default-max-tokens N] [--default-thinking-budget N] "
+           "[--default-max-tokens N] [--default-thinking-budget N] [--default-reasoning-effort E] "
            "[--vision] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--tolerant-tool-calls] "
            "[--cors] "
@@ -140,6 +140,9 @@ std::string serve_usage_text(const char* argv0) {
            "device N instead of pinned RAM (Single placement; N differs from --device)\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
+           "       --default-reasoning-effort low|medium|high|xhigh sets the effort of "
+           "thinking-enabled requests that name none (default: the template's, xhigh on "
+           "Qwen3.8); an explicit request effort always wins\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       --tolerant-tool-calls recovers complete Qwen tool calls that the strict parser "
            "would return\n"
@@ -353,6 +356,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--default-thinking-budget is out of range");
             }
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
+        } else if (arg == "--default-reasoning-effort") {
+            const std::string value = require_value("--default-reasoning-effort");
+            if (value == "low" || value == "minimal") {
+                options.default_reasoning_effort = ReasoningEffort::Low;
+            } else if (value == "medium") {
+                options.default_reasoning_effort = ReasoningEffort::Medium;
+            } else if (value == "high" || value == "xhigh" || value == "max") {
+                options.default_reasoning_effort = ReasoningEffort::XHigh;
+            } else {
+                throw std::invalid_argument(
+                    "--default-reasoning-effort must be one of low, medium, high, or xhigh");
+            }
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--vision-max-tokens" || arg == "--vision-limit") {
